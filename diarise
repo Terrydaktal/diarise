@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""
+condense_day_audio.py
+
+Pipeline:
+  1) Pre-pass (cheap, streaming): detect "dead air" (very low peak+RMS) runs >= N seconds, remove them.
+     - Uses windowed peak/RMS thresholds (conservative by default).
+  2) Silero VAD pass (streaming): find speech segments on the pre-passed audio.
+     - Keeps natural pauses by *only* removing non-speech gaps longer than N seconds.
+  3) Renders a final condensed file + JSON reports (removed/kept intervals).
+
+Requirements:
+  - ffmpeg + ffprobe in PATH
+  - Python: numpy, torch
+  - Internet ONCE for torch.hub to fetch Silero VAD model (cached afterward)
+
+Example:
+  python3 condense_day_audio.py input.mp3 output.m4a
+
+More conservative (miss less speech):
+  python3 condense_day_audio.py input.mp3 output.m4a \
+    --prepass-rms-db -65 --prepass-peak-db -60 \
+    --vad-threshold 0.25 --pad-pre 0.40 --pad-post 0.70
+
+Notes:
+  - This script intentionally avoids "choppy" audio by NOT removing small pauses.
+    It only removes dead-air gaps >= --gap-cut seconds (default 10).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import wave
+from collections import deque
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+import numpy as np
+
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def run(cmd: List[str], *, capture: bool = False, text: bool = True) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, check=True,
+                              stdout=subprocess.PIPE if capture else None,
+                              stderr=subprocess.PIPE if capture else None,
+                              text=text)
+    except subprocess.CalledProcessError as e:
+        if capture:
+            stderr = (e.stderr or "").strip()
+            stdout = (e.stdout or "").strip()
+            detail = "\n".join([x for x in [stdout, stderr] if x])
+            die(f"Command failed: {' '.join(cmd)}\n{detail}")
+        die(f"Command failed: {' '.join(cmd)}")
+
+def run_ffmpeg_with_progress(
+    cmd: List[str],
+    *,
+    label: str,
+    total_out_s: Optional[float] = None,
+    emit_every_s: float = 10.0,
+) -> None:
+    """
+    Run an ffmpeg command with `-progress pipe:2` enabled and periodically emit progress.
+    This keeps long renders "alive" (useful in non-interactive environments) and gives the user
+    a sense of where the command is.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if proc.stderr is None:
+        die(f"{label}: failed to start ffmpeg")
+
+    tail: deque[str] = deque(maxlen=60)
+    out_time_s: Optional[float] = None
+    last_emit = time.monotonic()
+
+    def maybe_emit(force: bool = False) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if not force and (now - last_emit) < emit_every_s:
+            return
+        last_emit = now
+        if out_time_s is None:
+            print(f"[{label}] running...", file=sys.stderr, flush=True)
+            return
+        if total_out_s and total_out_s > 0:
+            pct = max(0.0, min(100.0, (out_time_s / total_out_s) * 100.0))
+            print(f"[{label}] {out_time_s/60:.1f}m / {total_out_s/60:.1f}m ({pct:.1f}%)", file=sys.stderr, flush=True)
+        else:
+            print(f"[{label}] {out_time_s/60:.1f}m", file=sys.stderr, flush=True)
+
+    for raw in proc.stderr:
+        line = raw.strip()
+        if not line:
+            continue
+        tail.append(line)
+
+        if line.startswith("out_time_ms="):
+            try:
+                out_time_s = int(line.split("=", 1)[1]) / 1_000_000.0
+            except Exception:
+                pass
+        elif line.startswith("out_time="):
+            # HH:MM:SS.micro
+            v = line.split("=", 1)[1]
+            try:
+                hh, mm, ss = v.split(":")
+                out_time_s = (int(hh) * 3600) + (int(mm) * 60) + float(ss)
+            except Exception:
+                pass
+        elif line.startswith("progress="):
+            # ffmpeg emits progress=continue repeatedly; throttle our own output.
+            maybe_emit(force=False)
+
+    rc = proc.wait()
+    if rc != 0:
+        detail = "\n".join(tail)
+        die(f"{label}: ffmpeg failed (exit {rc}).\n{detail}")
+
+def which_or_die(bin_name: str) -> None:
+    if shutil.which(bin_name) is None:
+        die(f"Missing dependency: {bin_name} not found in PATH")
+
+def ffprobe_duration_seconds(path: str) -> float:
+    # duration can be missing for some streams; this is the most common method.
+    cp = run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ], capture=True)
+    s = (cp.stdout or "").strip()
+    if not s:
+        die("ffprobe did not return duration (unsupported container/stream?)")
+    try:
+        return float(s)
+    except ValueError:
+        die(f"ffprobe returned non-numeric duration: {s}")
+
+def ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+
+
+# -----------------------------
+# Interval logic
+# -----------------------------
+
+Interval = Tuple[float, float]  # (start_sec, end_sec), end > start
+
+def merge_intervals(intervals: List[Interval], gap: float = 0.0) -> List[Interval]:
+    """Merge overlapping intervals, and also merge if separated by <= gap."""
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: (x[0], x[1]))
+    out: List[Interval] = []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_e + gap:
+            cur_e = max(cur_e, e)
+        else:
+            out.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    out.append((cur_s, cur_e))
+    return out
+
+def clamp_intervals(intervals: List[Interval], lo: float, hi: float) -> List[Interval]:
+    out: List[Interval] = []
+    for s, e in intervals:
+        s2 = max(lo, s)
+        e2 = min(hi, e)
+        if e2 > s2:
+            out.append((s2, e2))
+    return out
+
+def complement_intervals(removed: List[Interval], total_dur: float) -> List[Interval]:
+    """Return keep intervals for [0,total_dur] minus removed."""
+    removed = merge_intervals(clamp_intervals(removed, 0.0, total_dur), gap=0.0)
+    keep: List[Interval] = []
+    cur = 0.0
+    for s, e in removed:
+        if s > cur:
+            keep.append((cur, s))
+        cur = max(cur, e)
+    if cur < total_dur:
+        keep.append((cur, total_dur))
+    return keep
+
+def drop_short(intervals: List[Interval], min_len: float) -> List[Interval]:
+    return [(s, e) for s, e in intervals if (e - s) >= min_len]
+
+
+# -----------------------------
+# Prepass: stream PCM and mark dead-air runs
+# -----------------------------
+
+@dataclass
+class PrepassConfig:
+    sr: int = 16000
+    window_s: float = 0.50        # analysis window (seconds)
+    min_dead_s: float = 10.0      # mark dead-air runs >= this
+    rms_db: float = -60.0         # dead-air if RMS below this
+    peak_db: float = -55.0        # and Peak below this
+    highpass_hz: float = 80.0     # reduce rumble biasing the RMS/peak
+    edge_keep_s: float = 0.40     # keep this much on each side of removed dead-air run
+    progress_every_s: float = 300.0  # log every N seconds of audio processed (0 disables)
+
+def _dbfs_from_lin(x: float, eps: float = 1e-12) -> float:
+    return 20.0 * math.log10(max(x, eps))
+
+def detect_dead_air_intervals(input_path: str, dur_s: float, cfg: PrepassConfig) -> List[Interval]:
+    """
+    Stream-decode to s16le mono cfg.sr, compute windowed peak/RMS, and detect long runs
+    where both are below thresholds.
+    """
+    bytes_per_sample = 2  # s16le
+    win_samples = max(1, int(cfg.window_s * cfg.sr))
+    win_bytes = win_samples * bytes_per_sample
+
+    ff_cmd = [
+        "ffmpeg", "-v", "error",
+        "-i", input_path,
+        "-af", f"highpass=f={cfg.highpass_hz:g}",
+        "-ac", "1", "-ar", str(cfg.sr),
+        "-f", "s16le", "-"
+    ]
+
+    # Don't pipe ffmpeg stderr without draining it: long/continuous decode errors can fill the pipe
+    # and deadlock the whole streaming loop. Write stderr to a temp file instead.
+    ffmpeg_stderr = tempfile.NamedTemporaryFile(prefix="ffmpeg_pcm_", suffix=".log", delete=False)
+    proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ffmpeg_stderr)
+    if proc.stdout is None:
+        die("Failed to start ffmpeg for PCM streaming")
+
+    removed: List[Interval] = []
+    silent_run_start: Optional[float] = None
+
+    processed_samples = 0
+    next_log_at = cfg.progress_every_s if cfg.progress_every_s > 0 else float("inf")
+
+    def read_exact(n: int) -> bytes:
+        # Read up to n bytes; may return fewer at EOF.
+        return proc.stdout.read(n)
+
+    while True:
+        buf = read_exact(win_bytes)
+        if not buf:
+            break
+
+        # Allow partial final window
+        samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
+        if samples.size == 0:
+            break
+
+        # Normalize to [-1, 1)
+        x = samples / 32768.0
+        peak = float(np.max(np.abs(x)))
+        rms = float(np.sqrt(np.mean(x * x)))
+
+        peak_db = _dbfs_from_lin(peak)
+        rms_db = _dbfs_from_lin(rms)
+
+        is_dead = (peak_db < cfg.peak_db) and (rms_db < cfg.rms_db)
+
+        t0 = processed_samples / cfg.sr
+        processed_samples += samples.size
+        t1 = processed_samples / cfg.sr
+
+        if cfg.progress_every_s > 0 and t1 >= next_log_at:
+            print(f"[prepass] scanned {t1/3600:.2f}h / {dur_s/3600:.2f}h", file=sys.stderr)
+            next_log_at += cfg.progress_every_s
+
+        if is_dead:
+            if silent_run_start is None:
+                silent_run_start = t0
+        else:
+            if silent_run_start is not None:
+                run_end = t0
+                if (run_end - silent_run_start) >= cfg.min_dead_s:
+                    # Remove only the "interior" of this dead-air run to protect boundaries.
+                    s = silent_run_start + cfg.edge_keep_s
+                    e = run_end - cfg.edge_keep_s
+                    if e > s:
+                        removed.append((s, e))
+                silent_run_start = None
+
+    # Finalize if file ends during dead run
+    if silent_run_start is not None:
+        run_end = processed_samples / cfg.sr
+        if (run_end - silent_run_start) >= cfg.min_dead_s:
+            s = silent_run_start + cfg.edge_keep_s
+            e = run_end - cfg.edge_keep_s
+            if e > s:
+                removed.append((s, e))
+
+    # Clean up ffmpeg process
+    proc.stdout.close()
+    proc.wait()
+    ffmpeg_stderr.close()
+    try:
+        if proc.returncode != 0:
+            try:
+                with open(ffmpeg_stderr.name, "r", encoding="utf-8", errors="ignore") as f:
+                    stderr = f.read().strip()
+            except OSError:
+                stderr = ""
+            die(f"ffmpeg PCM streaming failed:\n{stderr}")
+    finally:
+        try:
+            os.unlink(ffmpeg_stderr.name)
+        except OSError:
+            pass
+
+    removed = merge_intervals(removed, gap=0.0)
+    removed = clamp_intervals(removed, 0.0, dur_s)
+    return removed
+
+
+# -----------------------------
+# Rendering: build ffmpeg filter script (atrim + concat)
+# -----------------------------
+
+def write_concat_filter_script(keep: List[Interval], script_path: str, fade_s: float) -> None:
+    """
+    Generates an ffmpeg -filter_complex_script that:
+      - atrim each keep interval
+      - applies short fades to avoid clicks
+      - concat them
+    """
+    keep = drop_short(keep, min_len=0.010)
+    if not keep:
+        die("No keep intervals left to render (audio would be empty).")
+
+    lines: List[str] = []
+    for i, (s, e) in enumerate(keep):
+        dur = e - s
+        # If segment is very short, skip fades to avoid negative times.
+        fd = 0.0
+        if fade_s > 0 and dur > 2.5 * fade_s:
+            fd = fade_s
+
+        chain = f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=N/SR/TB"
+        if fd > 0.0:
+            # Fade-in always starts at 0
+            chain += f",afade=t=in:st=0:d={fd:.6f}"
+            # Fade-out starts at dur - fd
+            chain += f",afade=t=out:st={(dur - fd):.6f}:d={fd:.6f}"
+        chain += f"[a{i}];"
+        lines.append(chain)
+
+    concat_in = "".join([f"[a{i}]" for i in range(len(keep))])
+    lines.append(f"{concat_in}concat=n={len(keep)}:v=0:a=1[outa]")
+
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+def ffmpeg_render_keep_intervals(
+    input_path: str,
+    keep: List[Interval],
+    output_path: str,
+    *,
+    fade_s: float,
+    audio_codec: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
+) -> None:
+    """
+    Renders keep intervals from input into output using a generated filter script.
+    """
+    ensure_parent_dir(output_path)
+
+    with tempfile.TemporaryDirectory(prefix="condense_audio_") as td:
+        script_path = os.path.join(td, "filter.txt")
+        write_concat_filter_script(keep, script_path, fade_s=fade_s)
+
+        # Use -progress so long renders show activity and don't look hung.
+        total_out_s = sum((e - s) for s, e in keep)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-nostats",
+            "-v", "error",
+            "-progress", "pipe:2",
+            "-i", input_path,
+            "-filter_complex_script", script_path,
+            "-map", "[outa]"
+        ]
+        if audio_codec:
+            cmd += ["-c:a", audio_codec]
+        if extra_args:
+            cmd += extra_args
+        cmd += [output_path]
+        run_ffmpeg_with_progress(cmd, label="render", total_out_s=total_out_s)
+
+
+# -----------------------------
+# Silero VAD pass (streaming)
+# -----------------------------
+
+@dataclass
+class VADConfig:
+    sr: int = 16000
+    threshold: float = 0.30
+    block_samples: int = 512            # VADIterator works well with 512 @ 16k
+    min_speech_s: float = 0.20
+    pad_pre_s: float = 0.35
+    pad_post_s: float = 0.60
+    max_gap_to_keep_s: float = 10.0     # keep pauses up to this (avoid choppiness)
+    device: str = "cpu"                 # "cpu" or "cuda"
+
+def silero_vad_speech_segments_streaming(wav_16k_mono_s16: str, cfg: VADConfig) -> List[Interval]:
+    """
+    Streaming Silero VAD using torch.hub + VADIterator to avoid loading hours into memory.
+    """
+    try:
+        import torch
+    except ImportError:
+        die("Missing Python package: torch")
+
+    # Load Silero VAD model + utilities
+    # Cached after first run.
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        trust_repo=True
+    )
+
+    # Expect utils to include VADIterator
+    if not isinstance(utils, (list, tuple)) or len(utils) < 5:
+        die("Unexpected Silero utils layout from torch.hub (repo changed?)")
+
+    # Older/typical layout:
+    # (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
+    VADIterator = None
+    for u in utils:
+        if getattr(u, "__name__", "") == "VADIterator":
+            VADIterator = u
+            break
+    if VADIterator is None:
+        # Commonly it’s at index 3
+        if len(utils) >= 4 and getattr(utils[3], "__name__", "") == "VADIterator":
+            VADIterator = utils[3]
+        else:
+            die("Could not find VADIterator in Silero utils (repo changed?)")
+
+    device = torch.device(cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu")
+    model = model.to(device)
+    model.eval()
+
+    # Open PCM wav and stream frames
+    with wave.open(wav_16k_mono_s16, "rb") as wf:
+        if wf.getnchannels() != 1 or wf.getframerate() != cfg.sr or wf.getsampwidth() != 2:
+            die("VAD input must be 16kHz mono s16 WAV (internal bug: wrong preprocessing).")
+
+        total_frames = wf.getnframes()
+        total_dur = total_frames / cfg.sr
+        next_log_at = 300.0
+
+        # Create iterator; signature has changed across revisions, so keep it simple:
+        # threshold is usually passed into VADIterator(...) or via attribute.
+        try:
+            vad_it = VADIterator(model, threshold=cfg.threshold, sampling_rate=cfg.sr)
+        except TypeError:
+            try:
+                vad_it = VADIterator(model, threshold=cfg.threshold)
+            except TypeError:
+                vad_it = VADIterator(model)
+
+        # Ensure model state is clean
+        if hasattr(model, "reset_states"):
+            model.reset_states()
+
+        segments: List[Interval] = []
+        current_start: Optional[float] = None
+
+        # Read in blocks
+        frames_per_block = cfg.block_samples
+        with torch.no_grad():
+            while True:
+                b = wf.readframes(frames_per_block)
+                if not b:
+                    break
+                # Lightweight progress log (every ~5 minutes of audio).
+                t = wf.tell() / cfg.sr
+                if t >= next_log_at:
+                    print(f"[vad] processed {t/3600:.2f}h / {total_dur/3600:.2f}h", file=sys.stderr)
+                    next_log_at += 300.0
+                x = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
+                if x.size == 0:
+                    break
+                # Silero VAD expects chunks >= 512 samples at 16kHz. At EOF, `wave` can return
+                # a short final chunk; zero-pad it so the model doesn't error.
+                if x.size < cfg.block_samples:
+                    x = np.pad(x, (0, cfg.block_samples - x.size), mode="constant")
+                audio = torch.from_numpy(x).to(device)
+
+                # VADIterator returns dicts with 'start'/'end' events. Newer versions support
+                # return_seconds=True; older ones return sample indices. Prefer seconds, and
+                # normalize to seconds in both cases.
+                scale = 1.0
+                try:
+                    ev = vad_it(audio, return_seconds=True)
+                except TypeError:
+                    ev = vad_it(audio)
+                    scale = 1.0 / float(cfg.sr)
+
+                # Normalize possible return shapes.
+                events = []
+                if ev is None:
+                    events = []
+                elif isinstance(ev, dict):
+                    events = [ev]
+                elif isinstance(ev, (list, tuple)):
+                    events = list(ev)
+                else:
+                    events = []
+
+                for d in events:
+                    if not isinstance(d, dict):
+                        continue
+                    if "start" in d:
+                        current_start = float(d["start"]) * scale
+                    if "end" in d and current_start is not None:
+                        segments.append((current_start, float(d["end"]) * scale))
+                        current_start = None
+
+        # If we ended while "in speech", close it at end of file.
+        if current_start is not None:
+            segments.append((current_start, total_dur))
+
+    # Postprocess: clamp, drop shorts, pad, and merge while keeping pauses <= max_gap_to_keep_s
+    segments = clamp_intervals(segments, 0.0, float(total_dur))
+    segments = drop_short(segments, cfg.min_speech_s)
+
+    padded = []
+    for s, e in segments:
+        padded.append((s - cfg.pad_pre_s, e + cfg.pad_post_s))
+    padded = clamp_intervals(padded, 0.0, float(total_dur))
+
+    # Merge speech "islands" while preserving natural pauses up to max_gap_to_keep_s
+    merged = merge_intervals(padded, gap=cfg.max_gap_to_keep_s)
+    merged = drop_short(merged, cfg.min_speech_s)
+    return merged
+
+
+# -----------------------------
+# Codec choice for final output
+# -----------------------------
+
+def guess_codec_from_ext(path: str) -> Tuple[Optional[str], List[str]]:
+    """
+    Returns (codec, extra_args). If codec is None, ffmpeg will choose default.
+    """
+    ext = os.path.splitext(path.lower())[1]
+    if ext in (".wav",):
+        return ("pcm_s16le", [])
+    if ext in (".flac",):
+        return ("flac", [])
+    if ext in (".mp3",):
+        return ("libmp3lame", ["-q:a", "2"])
+    if ext in (".m4a", ".mp4"):
+        return ("aac", ["-b:a", "192k"])
+    if ext in (".opus",):
+        return ("libopus", ["-b:a", "96k"])
+    # unknown/let ffmpeg decide
+    return (None, [])
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main() -> None:
+    which_or_die("ffmpeg")
+    which_or_die("ffprobe")
+
+    ap = argparse.ArgumentParser(description="Condense a long recording by removing long dead-air gaps then using Silero VAD.")
+    ap.add_argument("input", help="Input audio/video file (any format ffmpeg can read)")
+    ap.add_argument("output", help="Final condensed output file (codec inferred from extension)")
+
+    # Prepass knobs
+    ap.add_argument("--gap-cut", type=float, default=10.0,
+                    help="Only remove non-speech/dead-air gaps longer than this many seconds (default: 10)")
+    ap.add_argument("--prepass-window", type=float, default=0.50, help="Prepass analysis window seconds (default: 0.50)")
+    ap.add_argument("--prepass-rms-db", type=float, default=-60.0, help="Prepass dead-air RMS threshold dBFS (default: -60)")
+    ap.add_argument("--prepass-peak-db", type=float, default=-55.0, help="Prepass dead-air peak threshold dBFS (default: -55)")
+    ap.add_argument("--prepass-highpass", type=float, default=80.0, help="Prepass highpass Hz (default: 80)")
+    ap.add_argument("--prepass-edge-keep", type=float, default=0.40, help="Keep this much at edges of removed runs (default: 0.40s)")
+
+    # VAD knobs
+    ap.add_argument("--vad-threshold", type=float, default=0.30, help="Silero VAD threshold (lower => higher recall) (default: 0.30)")
+    ap.add_argument("--vad-min-speech", type=float, default=0.20, help="Drop speech segments shorter than this (default: 0.20s)")
+    ap.add_argument("--pad-pre", type=float, default=0.35, help="Pad before each VAD segment (default: 0.35s)")
+    ap.add_argument("--pad-post", type=float, default=0.60, help="Pad after each VAD segment (default: 0.60s)")
+    ap.add_argument("--vad-block", type=int, default=512, help="VAD block size in samples @16k (default: 512)")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device for VAD model (default: cpu)")
+
+    # Rendering / output
+    ap.add_argument("--fade", type=float, default=0.02, help="Fade duration at cut points (seconds) (default: 0.02)")
+    ap.add_argument("--keep-temp", action="store_true", help="Keep intermediate files (in a temp dir) for inspection")
+    ap.add_argument("--report-json", default=None, help="Write a JSON report (intervals, settings) to this path")
+
+    args = ap.parse_args()
+
+    input_path = args.input
+    output_path = args.output
+
+    if not os.path.isfile(input_path):
+        die(f"Input file not found: {input_path}")
+
+    dur_s = ffprobe_duration_seconds(input_path)
+    print(f"[info] input duration: {dur_s/3600:.2f} hours", file=sys.stderr)
+
+    pre_cfg = PrepassConfig(
+        sr=16000,
+        window_s=args.prepass_window,
+        min_dead_s=args.gap_cut,
+        rms_db=args.prepass_rms_db,
+        peak_db=args.prepass_peak_db,
+        highpass_hz=args.prepass_highpass,
+        edge_keep_s=args.prepass_edge_keep,
+        progress_every_s=300.0,
+    )
+
+    vad_cfg = VADConfig(
+        sr=16000,
+        threshold=args.vad_threshold,
+        block_samples=args.vad_block,
+        min_speech_s=args.vad_min_speech,
+        pad_pre_s=args.pad_pre,
+        pad_post_s=args.pad_post,
+        max_gap_to_keep_s=args.gap_cut,
+        device=args.device,
+    )
+
+    report = {
+        "input": os.path.abspath(input_path),
+        "output": os.path.abspath(output_path),
+        "input_duration_s": dur_s,
+        "settings": {
+            "gap_cut_s": args.gap_cut,
+            "prepass": pre_cfg.__dict__,
+            "vad": vad_cfg.__dict__,
+            "fade_s": args.fade,
+        },
+        "prepass_removed": [],
+        "prepass_keep": [],
+        "vad_keep": [],
+    }
+
+    # Work dir
+    if args.keep_temp:
+        workdir = tempfile.mkdtemp(prefix="condense_audio_keep_")
+        print(f"[info] keeping intermediates in: {workdir}", file=sys.stderr)
+    else:
+        workdir_ctx = tempfile.TemporaryDirectory(prefix="condense_audio_")
+        workdir = workdir_ctx.name  # type: ignore
+
+    try:
+        # 1) Prepass detect + render
+        removed = detect_dead_air_intervals(input_path, dur_s, pre_cfg)
+        keep_pre = complement_intervals(removed, dur_s)
+        keep_pre = drop_short(keep_pre, 0.050)
+
+        report["prepass_removed"] = removed
+        report["prepass_keep"] = keep_pre
+
+        prepass_full = os.path.join(workdir, "prepass_full.flac")
+        print(f"[prepass] removing {len(removed)} dead-air intervals; rendering prepass_full.flac", file=sys.stderr)
+
+        ffmpeg_render_keep_intervals(
+            input_path,
+            keep_pre,
+            prepass_full,
+            fade_s=args.fade,
+            audio_codec="flac",
+        )
+
+        # 2) Make a VAD-friendly wav
+        prepass_vad = os.path.join(workdir, "prepass_vad_16k_mono.wav")
+        prepass_out_s = sum((e - s) for s, e in keep_pre)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-nostats",
+            "-v", "error",
+            "-progress", "pipe:2",
+            "-i", prepass_full,
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            prepass_vad
+        ]
+        run_ffmpeg_with_progress(cmd, label="wav", total_out_s=prepass_out_s)
+
+        # 3) Silero VAD keep intervals on prepass audio
+        print(f"[vad] running Silero VAD (streaming) on prepass audio", file=sys.stderr)
+        vad_keep = silero_vad_speech_segments_streaming(prepass_vad, vad_cfg)
+        report["vad_keep"] = vad_keep
+
+        # 4) Render final from prepass_full using VAD keep intervals
+        codec, extra = guess_codec_from_ext(output_path)
+        print(f"[render] rendering final output -> {output_path}", file=sys.stderr)
+
+        ffmpeg_render_keep_intervals(
+            prepass_full,
+            vad_keep,
+            output_path,
+            fade_s=args.fade,
+            audio_codec=codec,
+            extra_args=extra,
+        )
+
+        # 5) Optional JSON report
+        if args.report_json:
+            ensure_parent_dir(args.report_json)
+            with open(args.report_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            print(f"[info] wrote report: {args.report_json}", file=sys.stderr)
+
+        print("[done]", file=sys.stderr)
+
+    finally:
+        if not args.keep_temp:
+            # Clean temp dir
+            try:
+                workdir_ctx.cleanup()  # type: ignore
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Large inputs / local artifacts
+Recording_*.mp3
+sample_*.mp3
+*.wav
+
+# Outputs / reports
+*_condensed.*
+*_report.json
+*_run.log
+diarise_run.log
