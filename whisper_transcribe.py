@@ -35,6 +35,12 @@ def configure_hf_cache() -> None:
         repo_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf_cache")
         os.environ["HF_HOME"] = repo_cache
 
+def _whisper_cpu_compute_type(compute_type: str) -> str:
+    ct = (compute_type or "").lower()
+    if "float16" in ct or ct == "float16":
+        return "int8"
+    return compute_type
+
 def ffprobe_duration_seconds(path: str) -> float:
     try:
         cp = subprocess.run(
@@ -511,9 +517,9 @@ def main() -> None:
     ap.add_argument("--model", default="base", help="Whisper model size/name (default: base)")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                     help="Device for inference (default: auto)")
-    ap.add_argument("--compute-type", default="auto",
-                    help="CTranslate2 compute type, e.g. auto, int8, int8_float16, float16, float32 (default: auto)")
-    ap.add_argument("--language", default=None, help="Language code, e.g. en. Default: auto-detect")
+    ap.add_argument("--compute-type", default="float16",
+                    help="CTranslate2 compute type, e.g. int8, int8_float16, float16, float32 (default: float16)")
+    ap.add_argument("--language", default="en", help="Language code, e.g. en (default: en)")
     ap.add_argument("--task", default="transcribe", choices=["transcribe", "translate"], help="Task (default: transcribe)")
     ap.add_argument("--beam-size", type=int, default=5, help="Beam size (default: 5)")
     ap.set_defaults(vad_filter=True)
@@ -586,16 +592,26 @@ def main() -> None:
         except Exception:
             device = "cpu"
 
-    print(f"[info] model={args.model} device={device} compute_type={args.compute_type}", file=sys.stderr)
+    compute_type = args.compute_type
+    if device == "cpu":
+        compute_type2 = _whisper_cpu_compute_type(compute_type)
+        if compute_type2 != compute_type:
+            print(f"[info] cpu compute_type override: {compute_type} -> {compute_type2}", file=sys.stderr)
+            compute_type = compute_type2
+    print(f"[info] model={args.model} device={device} compute_type={compute_type}", file=sys.stderr)
     if device == "cuda":
         print("[info] If this errors, your NVIDIA driver/userspace may be mismatched; re-run with --device cpu.", file=sys.stderr)
 
     try:
-        model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
+        model = WhisperModel(args.model, device=device, compute_type=compute_type)
     except Exception as e:
         if device == "cuda":
-            die(f"Failed to initialize CUDA backend ({e}). Try: --device cpu")
-        raise
+            print(f"[warn] CUDA init failed ({e}); falling back to CPU", file=sys.stderr)
+            device = "cpu"
+            compute_type = _whisper_cpu_compute_type(compute_type)
+            model = WhisperModel(args.model, device=device, compute_type=compute_type)
+        else:
+            raise
 
     # Optional condensed->original timestamp mapping (for transcribing stitched outputs).
     timeline_map_path = args.timeline_map
