@@ -201,12 +201,10 @@ def write_sectioned_transcript(
             lines.append("")
             continue
         for s in seg_list:
-            start = float(s["start"])
-            end = float(s["end"])
             text = str(s.get("text", "")).strip()
             if not text:
                 continue
-            lines.append(f"[{start:8.2f}s -> {end:8.2f}s] {text}")
+            lines.append(text)
         lines.append("")
 
     ensure_parent_dir(out_path)

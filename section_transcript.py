@@ -165,8 +165,7 @@ def main() -> None:
         # Keep in original order.
         seg_list = sorted(seg_list, key=lambda s: (s.start, s.end))
         for s in seg_list:
-            rel = f"[{s.start:8.2f}s -> {s.end:8.2f}s]"
-            lines.append(f"{rel} {s.text}")
+            lines.append(s.text)
         lines.append("")
 
     with open(args.out, "w", encoding="utf-8") as f:
