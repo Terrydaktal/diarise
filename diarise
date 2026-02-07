@@ -312,14 +312,31 @@ def whisper_transcribe_to_files(
             raise
 
     t0 = time.time()
-    segments, info = model.transcribe(
-        input_path,
-        language=language,
-        task=task,
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-        clip_timestamps=clip_timestamps,
-    )
+    try:
+        segments, info = model.transcribe(
+            input_path,
+            language=language,
+            task=task,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            clip_timestamps=clip_timestamps,
+        )
+    except RuntimeError as e:
+        # Some CUDA setups can initialize but fail when the first GEMM runs (e.g. cuBLAS errors).
+        if dev == "cuda":
+            print(f"[whisper] CUDA runtime failed ({e}); falling back to CPU", file=sys.stderr)
+            dev = "cpu"
+            model = WhisperModel(model_name, device=dev, compute_type=compute_type)
+            segments, info = model.transcribe(
+                input_path,
+                language=language,
+                task=task,
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+                clip_timestamps=clip_timestamps,
+            )
+        else:
+            raise
 
     segs_out: List[Dict[str, Any]] = []
     texts: List[str] = []
