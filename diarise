@@ -426,6 +426,231 @@ class VADConfig:
     max_gap_to_keep_s: float = 10.0     # keep pauses up to this (avoid choppiness)
     device: str = "cpu"                 # "cpu" or "cuda"
 
+@dataclass
+class WebRTCVADConfig:
+    aggressiveness: int = 2             # 0..3 (higher => more aggressive filtering)
+    frame_ms: int = 30                  # 10/20/30 only
+    min_silence_ms: int = 300           # close a speech segment after this much continuous non-speech
+
+def silero_vad_speech_segments_streaming_ffmpeg(input_path: str, dur_s: float, cfg: VADConfig) -> List[Interval]:
+    """
+    Decode `input_path` -> 16kHz mono s16le with ffmpeg and run Silero VAD over the PCM stream.
+    Returns keep intervals in seconds.
+    """
+    try:
+        import torch
+    except ImportError:
+        die("Missing Python package: torch")
+
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        trust_repo=True,
+    )
+
+    VADIterator = None
+    if isinstance(utils, (list, tuple)):
+        for u in utils:
+            if getattr(u, "__name__", "") == "VADIterator":
+                VADIterator = u
+                break
+        if VADIterator is None and len(utils) >= 4 and getattr(utils[3], "__name__", "") == "VADIterator":
+            VADIterator = utils[3]
+    if VADIterator is None:
+        die("Could not find VADIterator in Silero utils (repo changed?)")
+
+    device = torch.device(cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu")
+    model = model.to(device)
+    model.eval()
+
+    # Stream-decode to PCM. Don't pipe stderr without draining it.
+    ffmpeg_stderr = tempfile.NamedTemporaryFile(prefix="ffmpeg_vad_", suffix=".log", delete=False)
+    ff_cmd = [
+        "ffmpeg", "-v", "error",
+        "-i", input_path,
+        "-ac", "1", "-ar", str(cfg.sr),
+        "-f", "s16le", "-"
+    ]
+    proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ffmpeg_stderr)
+    if proc.stdout is None:
+        die("Failed to start ffmpeg for VAD PCM streaming")
+
+    samples_per_block = max(1, int(cfg.block_samples))
+    bytes_per_block = samples_per_block * 2  # s16le
+
+    vad_it = VADIterator(model, threshold=cfg.threshold, sampling_rate=cfg.sr)
+    if hasattr(model, "reset_states"):
+        model.reset_states()
+
+    segments: List[Interval] = []
+    current_start_s: Optional[float] = None
+
+    processed_samples = 0
+    next_log_at = 300.0
+
+    with torch.no_grad():
+        while True:
+            buf = proc.stdout.read(bytes_per_block)
+            if not buf:
+                break
+            if len(buf) < bytes_per_block:
+                # Pad final short chunk so the model doesn't error.
+                buf = buf + b"\x00" * (bytes_per_block - len(buf))
+
+            x = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
+            processed_samples += x.size
+
+            t_s = processed_samples / cfg.sr
+            if t_s >= next_log_at:
+                total = dur_s if dur_s > 0 else t_s
+                print(f"[vad] processed {t_s/3600:.2f}h / {total/3600:.2f}h", file=sys.stderr)
+                next_log_at += 300.0
+
+            audio = torch.from_numpy(x).to(device)
+            ev = vad_it(audio)  # returns sample indices by default
+            if not ev:
+                continue
+            if isinstance(ev, dict):
+                if "start" in ev:
+                    current_start_s = float(ev["start"]) / float(cfg.sr)
+                if "end" in ev and current_start_s is not None:
+                    segments.append((current_start_s, float(ev["end"]) / float(cfg.sr)))
+                    current_start_s = None
+
+    total_dur = min(float(dur_s), processed_samples / cfg.sr) if dur_s else (processed_samples / cfg.sr)
+    if current_start_s is not None:
+        segments.append((current_start_s, total_dur))
+
+    proc.stdout.close()
+    proc.wait()
+    ffmpeg_stderr.close()
+    try:
+        if proc.returncode != 0:
+            try:
+                with open(ffmpeg_stderr.name, "r", encoding="utf-8", errors="ignore") as f:
+                    stderr = f.read().strip()
+            except OSError:
+                stderr = ""
+            die(f"ffmpeg VAD PCM streaming failed:\n{stderr}")
+    finally:
+        try:
+            os.unlink(ffmpeg_stderr.name)
+        except OSError:
+            pass
+
+    segments = clamp_intervals(segments, 0.0, total_dur)
+    segments = drop_short(segments, cfg.min_speech_s)
+
+    padded: List[Interval] = []
+    for s, e in segments:
+        padded.append((s - cfg.pad_pre_s, e + cfg.pad_post_s))
+    padded = clamp_intervals(padded, 0.0, total_dur)
+    merged = merge_intervals(padded, gap=cfg.max_gap_to_keep_s)
+    merged = drop_short(merged, cfg.min_speech_s)
+    return merged
+
+def webrtc_vad_speech_segments_streaming_ffmpeg(input_path: str, dur_s: float, cfg: VADConfig, wcfg: WebRTCVADConfig) -> List[Interval]:
+    """
+    Decode `input_path` -> 16kHz mono s16le with ffmpeg and run WebRTC VAD over the PCM stream.
+    Returns keep intervals in seconds.
+    """
+    try:
+        import webrtcvad
+    except ImportError:
+        die("Missing Python package: webrtcvad (pip install webrtcvad)")
+
+    if wcfg.frame_ms not in (10, 20, 30):
+        die("WebRTC VAD frame size must be 10, 20, or 30 ms")
+    if not (0 <= wcfg.aggressiveness <= 3):
+        die("WebRTC VAD aggressiveness must be 0..3")
+
+    vad = webrtcvad.Vad(wcfg.aggressiveness)
+    frame_s = wcfg.frame_ms / 1000.0
+    samples_per_frame = int(cfg.sr * frame_s)
+    bytes_per_frame = samples_per_frame * 2  # s16le mono
+    min_silence_frames = max(1, int(round((wcfg.min_silence_ms / 1000.0) / frame_s)))
+
+    ffmpeg_stderr = tempfile.NamedTemporaryFile(prefix="ffmpeg_webrtc_", suffix=".log", delete=False)
+    ff_cmd = [
+        "ffmpeg", "-v", "error",
+        "-i", input_path,
+        "-ac", "1", "-ar", str(cfg.sr),
+        "-f", "s16le", "-"
+    ]
+    proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ffmpeg_stderr)
+    if proc.stdout is None:
+        die("Failed to start ffmpeg for WebRTC PCM streaming")
+
+    segments: List[Interval] = []
+    in_speech = False
+    speech_start = 0.0
+    silence_run = 0
+    processed_frames = 0
+    next_log_at = 300.0
+
+    while True:
+        buf = proc.stdout.read(bytes_per_frame)
+        if not buf:
+            break
+        if len(buf) < bytes_per_frame:
+            buf = buf + b"\x00" * (bytes_per_frame - len(buf))
+
+        t_end = (processed_frames + 1) * frame_s
+        if t_end >= next_log_at:
+            total = dur_s if dur_s > 0 else t_end
+            print(f"[vad] processed {t_end/3600:.2f}h / {total/3600:.2f}h", file=sys.stderr)
+            next_log_at += 300.0
+
+        is_speech = vad.is_speech(buf, cfg.sr)
+        if is_speech:
+            if not in_speech:
+                in_speech = True
+                speech_start = processed_frames * frame_s
+            silence_run = 0
+        else:
+            if in_speech:
+                silence_run += 1
+                if silence_run >= min_silence_frames:
+                    end_t = (processed_frames + 1 - silence_run) * frame_s
+                    segments.append((speech_start, end_t))
+                    in_speech = False
+                    silence_run = 0
+
+        processed_frames += 1
+
+    total_dur = min(float(dur_s), processed_frames * frame_s) if dur_s else (processed_frames * frame_s)
+    if in_speech:
+        segments.append((speech_start, total_dur))
+
+    proc.stdout.close()
+    proc.wait()
+    ffmpeg_stderr.close()
+    try:
+        if proc.returncode != 0:
+            try:
+                with open(ffmpeg_stderr.name, "r", encoding="utf-8", errors="ignore") as f:
+                    stderr = f.read().strip()
+            except OSError:
+                stderr = ""
+            die(f"ffmpeg WebRTC PCM streaming failed:\n{stderr}")
+    finally:
+        try:
+            os.unlink(ffmpeg_stderr.name)
+        except OSError:
+            pass
+
+    segments = clamp_intervals(segments, 0.0, total_dur)
+    segments = drop_short(segments, cfg.min_speech_s)
+
+    padded: List[Interval] = []
+    for s, e in segments:
+        padded.append((s - cfg.pad_pre_s, e + cfg.pad_post_s))
+    padded = clamp_intervals(padded, 0.0, total_dur)
+    merged = merge_intervals(padded, gap=cfg.max_gap_to_keep_s)
+    merged = drop_short(merged, cfg.min_speech_s)
+    return merged
+
 def silero_vad_speech_segments_streaming(wav_16k_mono_s16: str, cfg: VADConfig) -> List[Interval]:
     """
     Streaming Silero VAD using torch.hub + VADIterator to avoid loading hours into memory.
@@ -593,9 +818,10 @@ def main() -> None:
     which_or_die("ffmpeg")
     which_or_die("ffprobe")
 
-    ap = argparse.ArgumentParser(description="Condense a long recording by removing long dead-air gaps then using Silero VAD.")
+    ap = argparse.ArgumentParser(description="Condense a long recording or output speech timestamps (VAD).")
     ap.add_argument("input", help="Input audio/video file (any format ffmpeg can read)")
-    ap.add_argument("output", help="Final condensed output file (codec inferred from extension)")
+    ap.add_argument("output", nargs="?", default=None,
+                    help="Final condensed output file (codec inferred from extension). Optional with --timestamps-only.")
 
     # Prepass knobs
     ap.add_argument("--gap-cut", type=float, default=10.0,
@@ -612,9 +838,19 @@ def main() -> None:
     ap.add_argument("--pad-pre", type=float, default=0.35, help="Pad before each VAD segment (default: 0.35s)")
     ap.add_argument("--pad-post", type=float, default=0.60, help="Pad after each VAD segment (default: 0.60s)")
     ap.add_argument("--vad-block", type=int, default=512, help="VAD block size in samples @16k (default: 512)")
+    ap.add_argument("--vad-backend", default="silero", choices=["silero", "webrtc"],
+                    help="VAD backend to use (default: silero)")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device for VAD model (default: cpu)")
 
+    # WebRTC VAD knobs (used only with --vad-backend webrtc)
+    ap.add_argument("--webrtc-aggressiveness", type=int, default=2, help="WebRTC VAD aggressiveness 0..3 (default: 2)")
+    ap.add_argument("--webrtc-frame-ms", type=int, default=30, choices=[10, 20, 30], help="WebRTC VAD frame size ms (default: 30)")
+    ap.add_argument("--webrtc-min-silence-ms", type=int, default=300,
+                    help="Close a speech segment after this much continuous non-speech (default: 300ms)")
+
     # Rendering / output
+    ap.add_argument("--timestamps-only", action="store_true",
+                    help="Only detect speech timestamps and write JSON (skips prepass and audio rendering).")
     ap.add_argument("--fade", type=float, default=0.02, help="Fade duration at cut points (seconds) (default: 0.02)")
     ap.add_argument("--keep-temp", action="store_true", help="Keep intermediate files (in a temp dir) for inspection")
     ap.add_argument("--report-json", default=None, help="Write a JSON report (intervals, settings) to this path")
@@ -652,20 +888,53 @@ def main() -> None:
         device=args.device,
     )
 
+    webrtc_cfg = WebRTCVADConfig(
+        aggressiveness=args.webrtc_aggressiveness,
+        frame_ms=args.webrtc_frame_ms,
+        min_silence_ms=args.webrtc_min_silence_ms,
+    )
+
     report = {
         "input": os.path.abspath(input_path),
-        "output": os.path.abspath(output_path),
+        "output": os.path.abspath(output_path) if output_path else None,
         "input_duration_s": dur_s,
         "settings": {
             "gap_cut_s": args.gap_cut,
             "prepass": pre_cfg.__dict__,
             "vad": vad_cfg.__dict__,
+            "vad_backend": args.vad_backend,
+            "webrtc": webrtc_cfg.__dict__,
             "fade_s": args.fade,
+            "timestamps_only": bool(args.timestamps_only),
         },
         "prepass_removed": [],
         "prepass_keep": [],
         "vad_keep": [],
     }
+
+    if args.timestamps_only:
+        report_path = args.report_json
+        if not report_path:
+            base = os.path.splitext(os.path.basename(input_path))[0]
+            report_path = f"{base}_vad.json"
+
+        if args.vad_backend == "silero":
+            print("[vad] running Silero VAD (ffmpeg PCM stream)", file=sys.stderr)
+            vad_keep = silero_vad_speech_segments_streaming_ffmpeg(input_path, dur_s, vad_cfg)
+        else:
+            print("[vad] running WebRTC VAD (ffmpeg PCM stream)", file=sys.stderr)
+            vad_keep = webrtc_vad_speech_segments_streaming_ffmpeg(input_path, dur_s, vad_cfg, webrtc_cfg)
+        report["vad_keep"] = vad_keep
+
+        ensure_parent_dir(report_path)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print(f"[info] wrote report: {report_path}", file=sys.stderr)
+        print("[done]", file=sys.stderr)
+        return
+
+    if not output_path:
+        die("Missing required output path (provide OUTPUT or use --timestamps-only).")
 
     # Work dir
     if args.keep_temp:
