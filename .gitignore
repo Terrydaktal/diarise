@@ -20,3 +20,6 @@ diarise_run.log
 *.vtt
 *.tsv
 *.txt
+
+# Local model/cache
+.hf_cache/

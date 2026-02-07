@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 
@@ -56,6 +57,104 @@ def ffprobe_duration_seconds(path: str) -> float:
     s = (cp.stdout or "").strip()
     return float(s) if s else 0.0
 
+def _parse_stat_time(s: str) -> datetime:
+    # Example: "2026-02-06 21:52:36.389693649 +0000"
+    s = s.strip()
+    if s == "-" or not s:
+        raise ValueError("empty/unknown time")
+
+    parts = s.split()
+    if len(parts) < 3:
+        raise ValueError(f"unexpected time format: {s}")
+    date_s, time_s, tz_s = parts[0], parts[1], parts[2]
+
+    # Trim ns -> us for Python.
+    if "." in time_s:
+        hhmmss, frac = time_s.split(".", 1)
+        frac = (frac + "000000")[:6]
+        time_s = f"{hhmmss}.{frac}"
+
+    # Convert +0000 -> +00:00 for fromisoformat.
+    if len(tz_s) == 5 and (tz_s[0] in "+-") and tz_s[1:].isdigit():
+        tz_s = f"{tz_s[0]}{tz_s[1:3]}:{tz_s[3:5]}"
+
+    return datetime.fromisoformat(f"{date_s}T{time_s}{tz_s}")
+
+def get_file_anchor_time(path: str) -> tuple[datetime, str]:
+    """
+    Returns (anchor_datetime, source) where source is "birth" or "mtime".
+    """
+    try:
+        birth = subprocess.check_output(["stat", "-c", "%w", path], text=True).strip()
+    except Exception as e:
+        raise RuntimeError(f"stat failed for {path}: {e}") from e
+
+    if birth and birth != "-":
+        return _parse_stat_time(birth), "birth"
+
+    mtime = subprocess.check_output(["stat", "-c", "%y", path], text=True).strip()
+    return _parse_stat_time(mtime), "mtime"
+
+def write_sectioned_transcript(
+    *,
+    out_path: str,
+    anchor_file: str,
+    segments: list[dict[str, Any]],
+    bin_minutes: int,
+) -> None:
+    if bin_minutes <= 0:
+        return
+
+    anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    bin_s = float(bin_minutes) * 60.0
+
+    # Group by bin index using segment start.
+    bins: dict[int, list[dict[str, Any]]] = {}
+    max_i = 0
+    for s in segments:
+        try:
+            start = float(s["start"])
+        except Exception:
+            continue
+        i = int(start // bin_s) if start > 0 else 0
+        max_i = max(max_i, i)
+        bins.setdefault(i, []).append(s)
+
+    def fmt_dt(dt: datetime) -> str:
+        return dt.isoformat(timespec="seconds")
+
+    lines: list[str] = []
+    lines.append(f"# Transcript sections ({bin_minutes} min bins)")
+    lines.append(f"# anchor_file: {os.path.abspath(anchor_file)}")
+    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src})")
+    lines.append("")
+
+    for i in range(0, max_i + 1):
+        bin_start_s = i * bin_s
+        bin_end_s = (i + 1) * bin_s
+        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
+        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        lines.append(
+            f"## {fmt_dt(abs_start)} to {fmt_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
+        )
+        seg_list = sorted(bins.get(i, []), key=lambda x: (float(x.get("start", 0.0)), float(x.get("end", 0.0))))
+        if not seg_list:
+            lines.append("[no transcript in this window]")
+            lines.append("")
+            continue
+        for s in seg_list:
+            start = float(s["start"])
+            end = float(s["end"])
+            text = str(s.get("text", "")).strip()
+            if not text:
+                continue
+            lines.append(f"[{start:8.2f}s -> {end:8.2f}s] {text}")
+        lines.append("")
+
+    ensure_parent_dir(out_path)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
+
 
 def ensure_parent_dir(path: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
@@ -78,6 +177,8 @@ def main() -> None:
     ap.add_argument("--beam-size", type=int, default=5, help="Beam size (default: 5)")
     ap.add_argument("--vad-filter", action="store_true", help="Enable faster-whisper's internal VAD filter")
     ap.add_argument("--log-every", type=float, default=300.0, help="Progress log interval seconds (default: 300)")
+    ap.add_argument("--section-minutes", type=int, default=30,
+                    help="Also write a sectioned transcript (*_sectioned.txt) with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--out-prefix", default=None,
                     help="Output prefix (default: INPUT basename without extension)")
     args = ap.parse_args()
@@ -97,6 +198,7 @@ def main() -> None:
 
     out_txt = f"{out_prefix}.txt"
     out_json = f"{out_prefix}.json"
+    out_sectioned = f"{out_prefix}_sectioned.txt"
 
     total_s = 0.0
     try:
@@ -177,8 +279,21 @@ def main() -> None:
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
+    try:
+        write_sectioned_transcript(
+            out_path=out_sectioned,
+            anchor_file=in_path,
+            segments=segs_out,
+            bin_minutes=args.section_minutes,
+        )
+    except Exception as e:
+        print(f"[warn] failed to write sectioned transcript: {e}", file=sys.stderr)
+
     dt = time.time() - t0
-    print(f"[done] wrote {out_txt} and {out_json} in {dt/60:.1f} min", file=sys.stderr)
+    if args.section_minutes > 0:
+        print(f"[done] wrote {out_txt}, {out_json}, {out_sectioned} in {dt/60:.1f} min", file=sys.stderr)
+    else:
+        print(f"[done] wrote {out_txt} and {out_json} in {dt/60:.1f} min", file=sys.stderr)
 
 
 if __name__ == "__main__":
