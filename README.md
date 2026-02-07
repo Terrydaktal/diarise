@@ -4,7 +4,7 @@ Single-command pipeline for long recordings:
 
 - Speech timestamps (VAD) as JSON
 - Optional condensed audio (stitch speech together)
-- Whisper transcription (faster-whisper) to TXT + JSON
+- Whisper transcription (faster-whisper) to TXT + JSON + a sectioned TXT (default 30 min bins)
 
 Recordings and generated outputs are intentionally ignored by git (see `.gitignore`).
 
@@ -42,17 +42,25 @@ This writes:
 
 - `Recording_whisper_base.txt`
 - `Recording_whisper_base.json`
+- `Recording_whisper_base_sectioned.txt`
 
 Defaults:
 
 - Whisper model: `--whisper-model base`
 - Whisper device: `--whisper-device cuda` (falls back to CPU if CUDA init fails)
 - faster-whisper internal VAD filter: enabled
+- Sectioned transcript bins: `--section-minutes 30` (set `0` to disable)
 
 Force CPU:
 
 ```bash
 ./diarise Recording.mp3 --whisper-device cpu --whisper-compute-type int8
+```
+
+Disable sectioned output:
+
+```bash
+./diarise Recording.mp3 --section-minutes 0
 ```
 
 ## Faster Skip-Silence Transcribe (`--prevad`)
