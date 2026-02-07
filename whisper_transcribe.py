@@ -95,6 +95,33 @@ def get_file_anchor_time(path: str) -> tuple[datetime, str]:
     mtime = subprocess.check_output(["stat", "-c", "%y", path], text=True).strip()
     return _parse_stat_time(mtime), "mtime"
 
+def load_diarise_anchor_file(report_json_path: str) -> str:
+    try:
+        with open(report_json_path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+    except OSError as e:
+        die(f"Failed to read diarise report JSON: {e}")
+    p = j.get("input")
+    if not isinstance(p, str) or not p:
+        die("Diarise report JSON missing 'input' path")
+    return p
+
+def guess_diarise_report_for_input(input_path: str) -> str | None:
+    """
+    Best-effort: if INPUT looks like an output from diarise, try to find the matching
+    `*_report.json` next to it and use its `input` as the anchor file.
+    """
+    d = os.path.dirname(os.path.abspath(input_path)) or "."
+    base = os.path.splitext(os.path.basename(input_path))[0]
+
+    # Common: <stem>_condensed(.ext) and report is <stem>_report.json
+    if "_condensed" in base:
+        stem = base.split("_condensed", 1)[0]
+        cand = os.path.join(d, f"{stem}_report.json")
+        if os.path.isfile(cand):
+            return cand
+    return None
+
 def write_sectioned_transcript(
     *,
     out_path: str,
@@ -179,6 +206,10 @@ def main() -> None:
     ap.add_argument("--log-every", type=float, default=300.0, help="Progress log interval seconds (default: 300)")
     ap.add_argument("--section-minutes", type=int, default=30,
                     help="Also write a sectioned transcript (*_sectioned.txt) with this bin size (default: 30). Set 0 to disable.")
+    ap.add_argument("--anchor-file", default=None,
+                    help="File whose filesystem time anchors the section timestamps (default: INPUT).")
+    ap.add_argument("--diarise-report", default=None,
+                    help="Path to diarise JSON report; uses its 'input' as the anchor file (overridden by --anchor-file).")
     ap.add_argument("--out-prefix", default=None,
                     help="Output prefix (default: INPUT basename without extension)")
     args = ap.parse_args()
@@ -280,9 +311,19 @@ def main() -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
     try:
+        anchor_file = in_path
+        if args.anchor_file:
+            anchor_file = args.anchor_file
+        elif args.diarise_report:
+            anchor_file = load_diarise_anchor_file(args.diarise_report)
+        else:
+            guessed = guess_diarise_report_for_input(in_path)
+            if guessed:
+                anchor_file = load_diarise_anchor_file(guessed)
+
         write_sectioned_transcript(
             out_path=out_sectioned,
-            anchor_file=in_path,
+            anchor_file=anchor_file,
             segments=segs_out,
             bin_minutes=args.section_minutes,
         )
