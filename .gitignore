@@ -3,10 +3,24 @@ venv/
 __pycache__/
 *.pyc
 
-# Large inputs / local artifacts
-Recording_*.mp3
-sample_*.mp3
+# Audio / video inputs (keep recordings out of git)
+*.mp3
+*.m4a
+*.aac
 *.wav
+*.flac
+*.ogg
+*.opus
+*.wma
+*.aiff
+*.aif
+*.mka
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.m4v
 
 # Outputs / reports
 *_condensed.*
@@ -16,6 +30,9 @@ diarise_run.log
 *_vad.json
 *_prevad.json
 *_whisper_*.json
+*.log
+*.err
+*.json
 
 # Transcription outputs
 *.srt
