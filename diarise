@@ -241,6 +241,37 @@ def get_file_anchor_time(path: str) -> Tuple[datetime, str]:
     dt, src = min(parsed, key=lambda x: x[0])
     return dt, f"earliest:{src}"
 
+def ffmpeg_tail_decodes_ok(path: str, *, seconds_from_end: float = 60.0, probe_len_s: float = 10.0) -> Tuple[bool, str]:
+    """
+    Quick corruption check: try decoding a short slice near the end of the file.
+    Returns (ok, note). "ok" means we could decode without ffmpeg error output/exit.
+    """
+    seconds_from_end = max(1.0, float(seconds_from_end))
+    probe_len_s = max(0.5, float(probe_len_s))
+
+    # Use -sseof to seek from end. This is fast and doesn't require scanning the whole file.
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-sseof",
+        f"-{seconds_from_end}",
+        "-t",
+        f"{probe_len_s}",
+        "-i",
+        path,
+        "-vn",
+        "-f",
+        "null",
+        "-",
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    err = (p.stderr or "").strip()
+    if p.returncode != 0 or err:
+        return False, "tail decode had ffmpeg errors (file may be truncated/corrupt)"
+    return True, "tail decode ok"
+
 def write_sectioned_transcript(
     *,
     out_path: str,
@@ -252,6 +283,10 @@ def write_sectioned_transcript(
         return
 
     anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    # Interpret anchor_dt as the end of the recording, and back-calculate the start using ffprobe duration.
+    dur_s = ffprobe_duration_seconds(anchor_file)
+    start_dt = anchor_dt - timedelta(seconds=float(dur_s))
+    tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
     bin_s = float(bin_minutes) * 60.0
 
     # Group by bin index using segment start.
@@ -272,14 +307,18 @@ def write_sectioned_transcript(
     lines: List[str] = []
     lines.append(f"# Transcript sections ({bin_minutes} min bins)")
     lines.append(f"# anchor_file: {anchor_file}")
-    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src})")
+    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src}) [assumed END of recording]")
+    if not tail_ok:
+        lines.append(f"# anchor_time_uncertain: true ({tail_note})")
+    lines.append(f"# duration_s: {float(dur_s):.3f}")
+    lines.append(f"# start_time: {fmt_dt(start_dt)} (anchor_time - duration)")
     lines.append("")
 
     for i in range(0, max_i + 1):
         bin_start_s = i * bin_s
         bin_end_s = (i + 1) * bin_s
-        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
-        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        abs_start = start_dt + timedelta(seconds=bin_start_s)
+        abs_end = start_dt + timedelta(seconds=bin_end_s)
         lines.append(
             f"## {fmt_dt(abs_start)} to {fmt_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
         )
@@ -313,6 +352,9 @@ def write_timestamped_transcript(
         return
 
     anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    dur_s = ffprobe_duration_seconds(anchor_file)
+    start_dt = anchor_dt - timedelta(seconds=float(dur_s))
+    tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
     bin_s = float(bin_minutes) * 60.0
 
     bins: Dict[int, List[Dict[str, Any]]] = {}
@@ -332,14 +374,18 @@ def write_timestamped_transcript(
     lines: List[str] = []
     lines.append(f"# Transcript (timestamped, {bin_minutes} min bins)")
     lines.append(f"# anchor_file: {anchor_file}")
-    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src})")
+    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src}) [assumed END of recording]")
+    if not tail_ok:
+        lines.append(f"# anchor_time_uncertain: true ({tail_note})")
+    lines.append(f"# duration_s: {float(dur_s):.3f}")
+    lines.append(f"# start_time: {fmt_dt(start_dt)} (anchor_time - duration)")
     lines.append("")
 
     for i in range(0, max_i + 1):
         bin_start_s = i * bin_s
         bin_end_s = (i + 1) * bin_s
-        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
-        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        abs_start = start_dt + timedelta(seconds=bin_start_s)
+        abs_end = start_dt + timedelta(seconds=bin_end_s)
         lines.append(
             f"## {fmt_dt(abs_start)} to {fmt_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
         )
@@ -619,11 +665,17 @@ def whisper_transcribe_to_files(
 
     ensure_parent_dir(out_json)
     anchor_dt, anchor_src = get_file_anchor_time(input_path)
+    anchor_tail_ok, anchor_tail_note = ffmpeg_tail_decodes_ok(input_path)
+    anchor_duration_s = ffprobe_duration_seconds(input_path)
     payload: Dict[str, Any] = {
         "input": os.path.abspath(input_path),
         "anchor_file": os.path.abspath(input_path),
         "anchor_time": anchor_dt.isoformat(timespec="seconds"),
         "anchor_time_src": anchor_src,
+        "anchor_time_assumed": "end_of_recording",
+        "anchor_time_uncertain": (not anchor_tail_ok),
+        "anchor_time_uncertain_note": (None if anchor_tail_ok else anchor_tail_note),
+        "anchor_duration_s": float(anchor_duration_s),
         "model": model_name,
         "device": dev,
         "compute_type": compute_type,

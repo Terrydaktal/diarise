@@ -111,6 +111,55 @@ def get_file_anchor_time(path: str) -> tuple[datetime, str]:
     dt, src = min(parsed, key=lambda x: x[0])
     return dt, f"earliest:{src}"
 
+def ffprobe_duration_seconds(path: str) -> float:
+    p = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {(p.stderr or '').strip()}")
+    return float((p.stdout or "").strip())
+
+def ffmpeg_tail_decodes_ok(path: str, *, seconds_from_end: float = 60.0, probe_len_s: float = 10.0) -> tuple[bool, str]:
+    seconds_from_end = max(1.0, float(seconds_from_end))
+    probe_len_s = max(0.5, float(probe_len_s))
+    p = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-sseof",
+            f"-{seconds_from_end}",
+            "-t",
+            f"{probe_len_s}",
+            "-i",
+            path,
+            "-vn",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    err = (p.stderr or "").strip()
+    if p.returncode != 0 or err:
+        return False, "tail decode had ffmpeg errors (file may be truncated/corrupt)"
+    return True, "tail decode ok"
+
 def load_diarise_anchor_file(report_json_path: str) -> str:
     try:
         with open(report_json_path, "r", encoding="utf-8") as f:
@@ -164,6 +213,9 @@ def write_sectioned_transcript(
         return
 
     anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    dur_s = ffprobe_duration_seconds(anchor_file)
+    start_dt = anchor_dt - timedelta(seconds=float(dur_s))
+    tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
     bin_s = float(bin_minutes) * 60.0
 
     # Group by bin index using segment start.
@@ -184,14 +236,18 @@ def write_sectioned_transcript(
     lines: list[str] = []
     lines.append(f"# Transcript sections ({bin_minutes} min bins)")
     lines.append(f"# anchor_file: {os.path.abspath(anchor_file)}")
-    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src})")
+    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src}) [assumed END of recording]")
+    if not tail_ok:
+        lines.append(f"# anchor_time_uncertain: true ({tail_note})")
+    lines.append(f"# duration_s: {float(dur_s):.3f}")
+    lines.append(f"# start_time: {fmt_dt(start_dt)} (anchor_time - duration)")
     lines.append("")
 
     for i in range(0, max_i + 1):
         bin_start_s = i * bin_s
         bin_end_s = (i + 1) * bin_s
-        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
-        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        abs_start = start_dt + timedelta(seconds=bin_start_s)
+        abs_end = start_dt + timedelta(seconds=bin_end_s)
         lines.append(
             f"## {fmt_dt(abs_start)} to {fmt_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
         )
@@ -222,6 +278,9 @@ def write_timestamped_transcript(
         return
 
     anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    dur_s = ffprobe_duration_seconds(anchor_file)
+    start_dt = anchor_dt - timedelta(seconds=float(dur_s))
+    tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
     bin_s = float(bin_minutes) * 60.0
 
     bins: dict[int, list[dict[str, Any]]] = {}
@@ -241,14 +300,18 @@ def write_timestamped_transcript(
     lines: list[str] = []
     lines.append(f"# Transcript (timestamped, {bin_minutes} min bins)")
     lines.append(f"# anchor_file: {os.path.abspath(anchor_file)}")
-    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src})")
+    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src}) [assumed END of recording]")
+    if not tail_ok:
+        lines.append(f"# anchor_time_uncertain: true ({tail_note})")
+    lines.append(f"# duration_s: {float(dur_s):.3f}")
+    lines.append(f"# start_time: {fmt_dt(start_dt)} (anchor_time - duration)")
     lines.append("")
 
     for i in range(0, max_i + 1):
         bin_start_s = i * bin_s
         bin_end_s = (i + 1) * bin_s
-        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
-        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        abs_start = start_dt + timedelta(seconds=bin_start_s)
+        abs_end = start_dt + timedelta(seconds=bin_end_s)
         lines.append(
             f"## {fmt_dt(abs_start)} to {fmt_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
         )
@@ -885,12 +948,18 @@ def main() -> None:
         if guessed:
             anchor_file = load_diarise_anchor_file(guessed)
     anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    anchor_tail_ok, anchor_tail_note = ffmpeg_tail_decodes_ok(anchor_file)
+    anchor_duration_s = ffprobe_duration_seconds(anchor_file)
 
     payload: Dict[str, Any] = {
         "input": os.path.abspath(in_path),
         "anchor_file": os.path.abspath(anchor_file),
         "anchor_time": anchor_dt.isoformat(timespec="seconds"),
         "anchor_time_src": anchor_src,
+        "anchor_time_assumed": "end_of_recording",
+        "anchor_time_uncertain": (not anchor_tail_ok),
+        "anchor_time_uncertain_note": (None if anchor_tail_ok else anchor_tail_note),
+        "anchor_duration_s": float(anchor_duration_s),
         "model": args.model,
         "device": device,
         "compute_type": args.compute_type,

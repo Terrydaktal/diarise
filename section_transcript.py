@@ -72,6 +72,55 @@ def get_file_anchor_time(path: str) -> Tuple[datetime, str]:
     dt, src = min(parsed, key=lambda x: x[0])
     return dt, f"earliest:{src}"
 
+def ffprobe_duration_seconds(path: str) -> float:
+    p = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {(p.stderr or '').strip()}")
+    return float((p.stdout or "").strip())
+
+def ffmpeg_tail_decodes_ok(path: str, *, seconds_from_end: float = 60.0, probe_len_s: float = 10.0) -> Tuple[bool, str]:
+    seconds_from_end = max(1.0, float(seconds_from_end))
+    probe_len_s = max(0.5, float(probe_len_s))
+    p = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-sseof",
+            f"-{seconds_from_end}",
+            "-t",
+            f"{probe_len_s}",
+            "-i",
+            path,
+            "-vn",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    err = (p.stderr or "").strip()
+    if p.returncode != 0 or err:
+        return False, "tail decode had ffmpeg errors (file may be truncated/corrupt)"
+    return True, "tail decode ok"
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -124,6 +173,10 @@ def main() -> None:
     args = ap.parse_args()
 
     anchor_dt, anchor_src = get_file_anchor_time(args.source_file)
+    # Interpret anchor_dt as the end of the recording, and back-calculate the start using ffprobe duration.
+    dur_s = ffprobe_duration_seconds(args.source_file)
+    start_dt = anchor_dt - timedelta(seconds=float(dur_s))
+    tail_ok, tail_note = ffmpeg_tail_decodes_ok(args.source_file)
     segs = load_segments(args.whisper_json)
 
     bin_s = float(args.bin_minutes) * 60.0
@@ -144,14 +197,18 @@ def main() -> None:
     lines: List[str] = []
     lines.append(f"# Transcript sections ({args.bin_minutes} min bins)")
     lines.append(f"# anchor_file: {args.source_file}")
-    lines.append(f"# anchor_time: {format_dt(anchor_dt)} ({anchor_src})")
+    lines.append(f"# anchor_time: {format_dt(anchor_dt)} ({anchor_src}) [assumed END of recording]")
+    if not tail_ok:
+        lines.append(f"# anchor_time_uncertain: true ({tail_note})")
+    lines.append(f"# duration_s: {float(dur_s):.3f}")
+    lines.append(f"# start_time: {format_dt(start_dt)} (anchor_time - duration)")
     lines.append("")
 
     for i in range(0, max_i + 1):
         bin_start_s = i * bin_s
         bin_end_s = (i + 1) * bin_s
-        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
-        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        abs_start = start_dt + timedelta(seconds=bin_start_s)
+        abs_end = start_dt + timedelta(seconds=bin_end_s)
 
         title = f"## {format_dt(abs_start)} to {format_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
         lines.append(title)
