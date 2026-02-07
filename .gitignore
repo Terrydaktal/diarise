@@ -14,7 +14,8 @@ sample_*.mp3
 *_run.log
 diarise_run.log
 *_vad.json
-*.json
+*_prevad.json
+*_whisper_*.json
 
 # Transcription outputs
 *.srt

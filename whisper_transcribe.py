@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
+from bisect import bisect_right
 from typing import Any, Dict, List
 
 
@@ -118,6 +119,21 @@ def guess_diarise_report_for_input(input_path: str) -> str | None:
     if "_condensed" in base:
         stem = base.split("_condensed", 1)[0]
         cand = os.path.join(d, f"{stem}_report.json")
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+def guess_prevad_report_for_input(input_path: str) -> str | None:
+    """
+    If INPUT looks like a condensed output from --prevad preprocessing, try to find
+    the matching `<stem>_prevad.json` next to it.
+    """
+    d = os.path.dirname(os.path.abspath(input_path)) or "."
+    base = os.path.splitext(os.path.basename(input_path))[0]
+
+    if base.endswith("_prevad_condensed"):
+        stem = base[: -len("_prevad_condensed")]
+        cand = os.path.join(d, f"{stem}_prevad.json")
         if os.path.isfile(cand):
             return cand
     return None
@@ -360,14 +376,112 @@ def _pairwise_clip_to_intervals(clip_timestamps: list[float]) -> list[list[float
 
 def _prevad_write_report_json(report_path: str, *, input_path: str, vad_keep: list[list[float]], settings: dict[str, Any]) -> None:
     ensure_parent_dir(report_path)
+    chunks: list[dict[str, float]] = []
+    t = 0.0
+    for s, e in vad_keep:
+        s2 = float(s)
+        e2 = float(e)
+        if e2 <= s2:
+            continue
+        dur = e2 - s2
+        chunks.append(
+            {
+                "orig_start": s2,
+                "orig_end": e2,
+                "condensed_start": t,
+                "condensed_end": t + dur,
+            }
+        )
+        t += dur
+
     payload = {
         "input": os.path.abspath(input_path),
         "vad_keep": vad_keep,
         "settings": settings,
+        "timeline_map": {
+            "type": "stitch",
+            "chunks": chunks,
+            "condensed_duration_s": t,
+        },
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+
+def _load_timeline_map(report_json_path: str) -> tuple[str | None, list[dict[str, float]]]:
+    try:
+        with open(report_json_path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+    except OSError as e:
+        die(f"Failed to read timeline map JSON: {e}")
+
+    orig = j.get("input")
+    if orig is not None and not isinstance(orig, str):
+        orig = None
+
+    tm = j.get("timeline_map")
+    if not isinstance(tm, dict):
+        die("Timeline map JSON missing 'timeline_map' object")
+    chunks = tm.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        die("Timeline map JSON missing non-empty 'timeline_map.chunks' list")
+
+    out_chunks: list[dict[str, float]] = []
+    for c in chunks:
+        if not isinstance(c, dict):
+            continue
+        try:
+            out_chunks.append(
+                {
+                    "orig_start": float(c["orig_start"]),
+                    "orig_end": float(c["orig_end"]),
+                    "condensed_start": float(c["condensed_start"]),
+                    "condensed_end": float(c["condensed_end"]),
+                }
+            )
+        except Exception:
+            continue
+    if not out_chunks:
+        die("Timeline map JSON had no valid chunks")
+    out_chunks.sort(key=lambda x: (x["condensed_start"], x["condensed_end"]))
+    return orig, out_chunks
+
+def _map_condensed_time_to_orig(t: float, chunks: list[dict[str, float]], starts: list[float]) -> float:
+    if not chunks:
+        return t
+    i = bisect_right(starts, t) - 1
+    if i < 0:
+        i = 0
+    if i >= len(chunks):
+        i = len(chunks) - 1
+
+    c = chunks[i]
+    # If t lands just after the end (rounding), move forward.
+    if t > c["condensed_end"] and i + 1 < len(chunks):
+        c = chunks[i + 1]
+
+    offset = t - c["condensed_start"]
+    orig_len = max(0.0, c["orig_end"] - c["orig_start"])
+    offset = max(0.0, min(offset, orig_len))
+    return c["orig_start"] + offset
+
+def _map_segments_condensed_to_orig(segments: list[dict[str, Any]], chunks: list[dict[str, float]]) -> list[dict[str, Any]]:
+    starts = [c["condensed_start"] for c in chunks]
+    out: list[dict[str, Any]] = []
+    for s in segments:
+        try:
+            cs = float(s["start"])
+            ce = float(s["end"])
+        except Exception:
+            out.append(s)
+            continue
+        ns = _map_condensed_time_to_orig(cs, chunks, starts)
+        ne = _map_condensed_time_to_orig(ce, chunks, starts)
+        s2 = dict(s)
+        s2["start"] = float(ns)
+        s2["end"] = float(ne)
+        out.append(s2)
+    return out
 
 
 def _prevad_render_condensed_audio(
@@ -424,6 +538,8 @@ def main() -> None:
                     help="In --prevad mode, also render a condensed audio file using diarise (default: <out_prefix>_prevad_condensed.m4a)")
     ap.add_argument("--prevad-no-preprocess", action="store_true",
                     help="In --prevad mode, skip writing the VAD JSON / condensed audio (transcription still uses clip_timestamps).")
+    ap.add_argument("--timeline-map", default=None,
+                    help="Map timestamps from a condensed stitched file back to original time using a prevad JSON report (with timeline_map).")
     ap.add_argument("--log-every", type=float, default=300.0, help="Progress log interval seconds (default: 300)")
     ap.add_argument("--section-minutes", type=int, default=30,
                     help="Also write a sectioned transcript (*_sectioned.txt) with this bin size (default: 30). Set 0 to disable.")
@@ -480,6 +596,16 @@ def main() -> None:
         if device == "cuda":
             die(f"Failed to initialize CUDA backend ({e}). Try: --device cpu")
         raise
+
+    # Optional condensed->original timestamp mapping (for transcribing stitched outputs).
+    timeline_map_path = args.timeline_map
+    if not timeline_map_path:
+        timeline_map_path = guess_prevad_report_for_input(in_path)
+    map_orig_input: str | None = None
+    map_chunks: list[dict[str, float]] | None = None
+    if timeline_map_path:
+        map_orig_input, map_chunks = _load_timeline_map(timeline_map_path)
+        print(f"[info] using timeline map: {timeline_map_path}", file=sys.stderr)
 
     clip_timestamps: list[float] | str = "0"
     vad_filter = bool(args.vad_filter)
@@ -574,6 +700,12 @@ def main() -> None:
         )
         texts.append(s.text.strip())
 
+    # If we transcribed a condensed stitched file and have a map, remap segment timestamps to original time.
+    # Keep the raw condensed segments in the JSON for debugging.
+    segs_raw: List[Dict[str, Any]] = segs_out
+    if map_chunks is not None:
+        segs_out = _map_segments_condensed_to_orig(segs_raw, map_chunks)
+
     ensure_parent_dir(out_txt)
     with open(out_txt, "w", encoding="utf-8") as f:
         f.write("\n".join([t for t in texts if t]) + "\n")
@@ -591,6 +723,9 @@ def main() -> None:
         "prevad_no_preprocess": bool(args.prevad_no_preprocess),
         "prevad_report_json": os.path.abspath(prevad_report_json_path) if prevad_report_json_path else None,
         "prevad_condensed_out": os.path.abspath(prevad_condensed_out_path) if prevad_condensed_out_path else None,
+        "timeline_map": os.path.abspath(timeline_map_path) if timeline_map_path else None,
+        "timeline_map_input": os.path.abspath(map_orig_input) if map_orig_input else None,
+        "segments_condensed": segs_raw if map_chunks is not None else None,
         "vad_filter": bool(args.vad_filter) if not args.prevad else False,
         "clip_timestamps": clip_timestamps if args.prevad else None,
         "segments": segs_out,
@@ -602,6 +737,8 @@ def main() -> None:
         anchor_file = in_path
         if args.anchor_file:
             anchor_file = args.anchor_file
+        elif map_orig_input and os.path.isfile(map_orig_input):
+            anchor_file = map_orig_input
         elif args.diarise_report:
             anchor_file = load_diarise_anchor_file(args.diarise_report)
         else:
