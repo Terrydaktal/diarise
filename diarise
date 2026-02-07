@@ -211,6 +211,62 @@ def _intervals_to_clip_timestamps(intervals: List[Interval]) -> List[float]:
             clip.extend([float(s), float(e)])
     return clip
 
+def _build_stitch_chunks(keep_intervals: List[Interval]) -> tuple[List[Dict[str, float]], float]:
+    """
+    Given intervals in the ORIGINAL timeline that are stitched back-to-back into a new file,
+    build a mapping "chunks" list describing original<->stitched time.
+    """
+    chunks: List[Dict[str, float]] = []
+    t = 0.0
+    for s, e in keep_intervals:
+        s2 = float(s)
+        e2 = float(e)
+        if e2 <= s2:
+            continue
+        dur = e2 - s2
+        chunks.append(
+            {
+                "orig_start": s2,
+                "orig_end": e2,
+                "stitched_start": t,
+                "stitched_end": t + dur,
+            }
+        )
+        t += dur
+    return chunks, t
+
+def _map_stitched_interval_to_orig(interval: Interval, chunks: List[Dict[str, float]]) -> List[Interval]:
+    """
+    Map [start,end] in stitched time back into one or more ORIGINAL intervals.
+    Splits at stitch boundaries so we never bridge across removed dead-air.
+    """
+    s, e = float(interval[0]), float(interval[1])
+    if e <= s:
+        return []
+    out: List[Interval] = []
+    for c in chunks:
+        cs = c["stitched_start"]
+        ce = c["stitched_end"]
+        if ce <= s:
+            continue
+        if cs >= e:
+            break
+        seg_s = max(s, cs)
+        seg_e = min(e, ce)
+        if seg_e <= seg_s:
+            continue
+        # Convert offset within chunk to original.
+        off_s = seg_s - cs
+        off_e = seg_e - cs
+        out.append((c["orig_start"] + off_s, c["orig_start"] + off_e))
+    return out
+
+def _map_stitched_intervals_to_orig(intervals: List[Interval], chunks: List[Dict[str, float]]) -> List[Interval]:
+    out: List[Interval] = []
+    for iv in intervals:
+        out.extend(_map_stitched_interval_to_orig(iv, chunks))
+    return out
+
 def whisper_transcribe_to_files(
     *,
     input_path: str,
@@ -225,6 +281,7 @@ def whisper_transcribe_to_files(
     vad_filter: bool,
     clip_timestamps: List[float] | str,
     vad_keep: Optional[List[Interval]] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> None:
     configure_hf_cache()
 
@@ -301,6 +358,8 @@ def whisper_transcribe_to_files(
         "segments": segs_out,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
+    if extra_payload:
+        payload.update(extra_payload)
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
@@ -1094,12 +1153,54 @@ def main() -> None:
         vad_keep: Optional[List[Interval]] = None
         clip_timestamps: List[float] | str = "0"
         vad_filter = bool(args.whisper_vad_filter)
+        extra_payload: Dict[str, Any] = {}
 
         if args.prevad:
-            print("[prevad] running WebRTC VAD (ffmpeg PCM stream)", file=sys.stderr)
-            vad_keep = webrtc_vad_speech_segments_streaming_ffmpeg(input_path, dur_s, vad_cfg, webrtc_cfg)
-            if not vad_keep:
+            # Prepass dead-air removal (stitched) -> WebRTC VAD on prepassed audio -> map back to original timeline.
+            if args.keep_temp:
+                workdir = tempfile.mkdtemp(prefix="transcribe_prevad_keep_")
+                print(f"[info] keeping prevad intermediates in: {workdir}", file=sys.stderr)
+            else:
+                workdir_ctx = tempfile.TemporaryDirectory(prefix="transcribe_prevad_")
+                workdir = workdir_ctx.name  # type: ignore
+
+            removed = detect_dead_air_intervals(input_path, dur_s, pre_cfg)
+            keep_pre = complement_intervals(removed, dur_s)
+            keep_pre = drop_short(keep_pre, 0.050)
+            prepass_out_s = sum((e - s) for s, e in keep_pre)
+            extra_payload["prepass_removed"] = removed
+            extra_payload["prepass_keep"] = keep_pre
+
+            prepass_full = os.path.join(workdir, "prepass_full.flac")
+            print(f"[prepass] removing {len(removed)} dead-air intervals; rendering prepass_full.flac", file=sys.stderr)
+            ffmpeg_render_keep_intervals(
+                input_path,
+                keep_pre,
+                prepass_full,
+                fade_s=args.fade,
+                audio_codec="flac",
+            )
+
+            print("[prevad] running WebRTC VAD on prepass_full.flac (ffmpeg PCM stream)", file=sys.stderr)
+            vad_keep_stitched = webrtc_vad_speech_segments_streaming_ffmpeg(prepass_full, prepass_out_s, vad_cfg, webrtc_cfg)
+            if not vad_keep_stitched:
                 die("Pre-VAD produced no keep intervals; nothing to transcribe.")
+
+            chunks, stitched_dur = _build_stitch_chunks(keep_pre)
+            vad_keep_mapped = _map_stitched_intervals_to_orig(vad_keep_stitched, chunks)
+            vad_keep_mapped = clamp_intervals(vad_keep_mapped, 0.0, dur_s)
+            vad_keep_mapped = merge_intervals(vad_keep_mapped, gap=0.0)
+
+            extra_payload["prevad"] = {
+                "backend": "webrtc",
+                "source": "prepass_full.flac",
+                "prepass_full": os.path.abspath(prepass_full),
+                "stitched_duration_s": stitched_dur,
+                "timeline_chunks": chunks,
+                "vad_keep_stitched": vad_keep_stitched,
+            }
+
+            vad_keep = vad_keep_mapped
             clip_timestamps = _intervals_to_clip_timestamps(vad_keep)
             vad_filter = False
 
@@ -1116,6 +1217,7 @@ def main() -> None:
             vad_filter=vad_filter,
             clip_timestamps=clip_timestamps,
             vad_keep=vad_keep,
+            extra_payload=extra_payload,
         )
         return
 
