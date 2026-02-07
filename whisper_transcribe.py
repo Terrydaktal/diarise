@@ -557,7 +557,7 @@ def main() -> None:
                     help="Map timestamps from a condensed stitched file back to original time using a prevad JSON report (with timeline_map).")
     ap.add_argument("--log-every", type=float, default=300.0, help="Progress log interval seconds (default: 300)")
     ap.add_argument("--section-minutes", type=int, default=30,
-                    help="Also write a sectioned transcript (*_sectioned.txt) with this bin size (default: 30). Set 0 to disable.")
+                    help="Also write a timestamped transcript (*_timestamped.txt) with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--anchor-file", default=None,
                     help="File whose filesystem time anchors the section timestamps (default: INPUT).")
     ap.add_argument("--diarise-report", default=None,
@@ -581,7 +581,7 @@ def main() -> None:
 
     out_txt = f"{out_prefix}.txt"
     out_json = f"{out_prefix}.json"
-    out_sectioned = f"{out_prefix}_sectioned.txt"
+    out_sectioned = f"{out_prefix}_timestamped.txt"
 
     total_s = 0.0
     try:

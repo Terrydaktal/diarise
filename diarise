@@ -409,7 +409,7 @@ def whisper_transcribe_to_files(
 
     out_txt = f"{out_prefix}.txt"
     out_json = f"{out_prefix}.json"
-    out_sectioned = f"{out_prefix}_sectioned.txt"
+    out_sectioned = f"{out_prefix}_timestamped.txt"
 
     total_s = 0.0
     try:
@@ -1237,7 +1237,7 @@ def main() -> None:
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--section-minutes", type=int, default=30,
-                    help="Write <out_prefix>_sectioned.txt with this bin size (default: 30). Set 0 to disable.")
+                    help="Write <out_prefix>_timestamped.txt with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--prevad", action="store_true",
                     help="In transcription mode, run dead-air prepass + WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables whisper VAD).")
 
