@@ -1056,7 +1056,34 @@ def silero_vad_speech_segments_streaming_ffmpeg(input_path: str, dur_s: float, c
     merged = drop_short(merged, cfg.min_speech_s)
     return merged
 
-def webrtc_vad_speech_segments_streaming_ffmpeg(input_path: str, dur_s: float, cfg: VADConfig, wcfg: WebRTCVADConfig) -> List[Interval]:
+def _write_ffmpeg_concat_list(path: str, keep_intervals: List[Interval], out_path: str) -> None:
+    """
+    Writes an ffmpeg concat demuxer list that plays only [start,end] from `path` for each keep interval.
+    """
+    abs_path = os.path.abspath(path)
+    lines: List[str] = []
+    for s, e in keep_intervals:
+        s2 = float(s)
+        e2 = float(e)
+        if e2 <= s2:
+            continue
+        # Avoid quoting complexity; repo paths have no spaces. If your path has spaces, move the file or
+        # use a symlink without spaces.
+        lines.append(f"file {abs_path}")
+        lines.append(f"inpoint {s2:.6f}")
+        lines.append(f"outpoint {e2:.6f}")
+    ensure_parent_dir(out_path)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+
+def webrtc_vad_speech_segments_streaming_ffmpeg(
+    input_path: str,
+    dur_s: float,
+    cfg: VADConfig,
+    wcfg: WebRTCVADConfig,
+    *,
+    concat_list: Optional[str] = None,
+) -> List[Interval]:
     """
     Decode `input_path` -> 16kHz mono s16le with ffmpeg and run WebRTC VAD over the PCM stream.
     Returns keep intervals in seconds.
@@ -1078,12 +1105,24 @@ def webrtc_vad_speech_segments_streaming_ffmpeg(input_path: str, dur_s: float, c
     min_silence_frames = max(1, int(round((wcfg.min_silence_ms / 1000.0) / frame_s)))
 
     ffmpeg_stderr = tempfile.NamedTemporaryFile(prefix="ffmpeg_webrtc_", suffix=".log", delete=False)
-    ff_cmd = [
-        "ffmpeg", "-v", "error",
-        "-i", input_path,
-        "-ac", "1", "-ar", str(cfg.sr),
-        "-f", "s16le", "-"
-    ]
+    if concat_list:
+        ff_cmd = [
+            "ffmpeg", "-v", "error",
+            "-safe", "0",
+            "-f", "concat",
+            "-i", concat_list,
+            "-vn",
+            "-ac", "1", "-ar", str(cfg.sr),
+            "-f", "s16le", "-"
+        ]
+    else:
+        ff_cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", input_path,
+            "-vn",
+            "-ac", "1", "-ar", str(cfg.sr),
+            "-f", "s16le", "-"
+        ]
     proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ffmpeg_stderr)
     if proc.stdout is None:
         die("Failed to start ffmpeg for WebRTC PCM streaming")
@@ -1495,18 +1534,19 @@ def main() -> None:
             extra_payload["prepass_removed"] = removed
             extra_payload["prepass_keep"] = keep_pre
 
-            prepass_full = os.path.join(workdir, "prepass_full.flac")
-            print(f"[prepass] removing {len(removed)} dead-air intervals; rendering prepass_full.flac", file=sys.stderr)
-            ffmpeg_render_keep_intervals(
-                input_path,
-                keep_pre,
-                prepass_full,
-                fade_s=args.fade,
-                audio_codec="flac",
-            )
+            # Fast path: don't render a stitched intermediate file.
+            # Stream only the keep intervals via ffmpeg concat demuxer and run VAD on that PCM stream.
+            concat_list = os.path.join(workdir, "prepass_keep.concat.txt")
+            _write_ffmpeg_concat_list(input_path, keep_pre, concat_list)
 
-            print("[prevad] running WebRTC VAD on prepass_full.flac (ffmpeg PCM stream)", file=sys.stderr)
-            vad_keep_stitched = webrtc_vad_speech_segments_streaming_ffmpeg(prepass_full, prepass_out_s, vad_cfg, webrtc_cfg)
+            print("[prevad] running WebRTC VAD on prepass keep intervals (ffmpeg concat -> PCM stream)", file=sys.stderr)
+            vad_keep_stitched = webrtc_vad_speech_segments_streaming_ffmpeg(
+                input_path,
+                prepass_out_s,
+                vad_cfg,
+                webrtc_cfg,
+                concat_list=concat_list,
+            )
             if not vad_keep_stitched:
                 die("Pre-VAD produced no keep intervals; nothing to transcribe.")
 
@@ -1517,8 +1557,8 @@ def main() -> None:
 
             extra_payload["prevad"] = {
                 "backend": "webrtc",
-                "source": "prepass_full.flac",
-                "prepass_full": os.path.abspath(prepass_full),
+                "source": "concat_stream",
+                "concat_list": os.path.abspath(concat_list),
                 "stitched_duration_s": stitched_dur,
                 "timeline_chunks": chunks,
                 "vad_keep_stitched": vad_keep_stitched,
