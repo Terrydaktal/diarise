@@ -31,7 +31,13 @@ pip install -U pip
 pip install torch torchaudio webrtcvad faster-whisper
 ```
 
-## `diarise` (VAD + optional condense)
+## `diarise` (All-In-One)
+
+`./diarise` is the main entry point. It can:
+
+- Output speech timestamps (VAD) to JSON
+- Render condensed audio from VAD keep-intervals
+- Transcribe to TXT/JSON with Whisper (faster-whisper)
 
 The `./diarise` script can:
 
@@ -52,7 +58,24 @@ Notes:
 - `--timestamps-only` **skips** the old “prepass” dead-air removal and does not render any audio.
 - `--condense-from-json` preserves the input’s sample rate and channel count in the output.
 
-## `whisper_transcribe.py` (Whisper + timestamps)
+### Whisper transcription (TXT + JSON)
+
+Transcribe an input to `<out_prefix>.txt` and `<out_prefix>.json`:
+
+```bash
+. .venv/bin/activate
+./diarise Recording.mp3 --transcribe --whisper-model base --whisper-device cpu --whisper-compute-type int8
+```
+
+By default, this uses faster-whisper’s built-in `vad_filter` (enabled) and does **not** do any external preprocessing.
+
+If you want a fast prepass to skip silence, add `--prevad` (WebRTC VAD) which feeds `clip_timestamps` to Whisper:
+
+```bash
+./diarise Recording.mp3 --transcribe --prevad --whisper-model base --whisper-device cpu --whisper-compute-type int8
+```
+
+## `whisper_transcribe.py` (Optional)
 
 Transcribe directly (default: faster-whisper built-in VAD filter enabled):
 

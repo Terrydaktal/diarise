@@ -39,9 +39,10 @@ import sys
 import tempfile
 import time
 import wave
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -184,6 +185,127 @@ def ensure_parent_dir(path: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
+
+def configure_hf_cache() -> None:
+    # HuggingFace Hub defaults to ~/.cache/huggingface; that can be non-writable on some setups.
+    # Use a repo-local cache by default.
+    if "HF_HOME" not in os.environ:
+        repo_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf_cache")
+        os.environ["HF_HOME"] = repo_cache
+
+def _choose_whisper_device(device: str) -> str:
+    if device != "auto":
+        return device
+    try:
+        import ctypes
+
+        ctypes.CDLL("libcuda.so.1")
+        return "cuda"
+    except Exception:
+        return "cpu"
+
+def _intervals_to_clip_timestamps(intervals: List[Interval]) -> List[float]:
+    clip: List[float] = []
+    for s, e in intervals:
+        if e > s:
+            clip.extend([float(s), float(e)])
+    return clip
+
+def whisper_transcribe_to_files(
+    *,
+    input_path: str,
+    out_prefix: str,
+    model_name: str,
+    device: str,
+    compute_type: str,
+    language: Optional[str],
+    task: str,
+    beam_size: int,
+    log_every_s: float,
+    vad_filter: bool,
+    clip_timestamps: List[float] | str,
+    vad_keep: Optional[List[Interval]] = None,
+) -> None:
+    configure_hf_cache()
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        die("Missing dependency: faster-whisper. Install with: pip install faster-whisper")
+
+    out_txt = f"{out_prefix}.txt"
+    out_json = f"{out_prefix}.json"
+
+    total_s = 0.0
+    try:
+        total_s = ffprobe_duration_seconds(input_path)
+    except Exception:
+        total_s = 0.0
+
+    dev = _choose_whisper_device(device)
+    print(f"[whisper] model={model_name} device={dev} compute_type={compute_type}", file=sys.stderr)
+    try:
+        model = WhisperModel(model_name, device=dev, compute_type=compute_type)
+    except Exception as e:
+        if dev == "cuda":
+            print(f"[whisper] CUDA init failed ({e}); falling back to CPU", file=sys.stderr)
+            dev = "cpu"
+            model = WhisperModel(model_name, device=dev, compute_type=compute_type)
+        else:
+            raise
+
+    t0 = time.time()
+    segments, info = model.transcribe(
+        input_path,
+        language=language,
+        task=task,
+        beam_size=beam_size,
+        vad_filter=vad_filter,
+        clip_timestamps=clip_timestamps,
+    )
+
+    segs_out: List[Dict[str, Any]] = []
+    texts: List[str] = []
+    next_log_at = log_every_s if log_every_s > 0 else float("inf")
+    for s in segments:
+        end_t = float(s.end)
+        if end_t >= next_log_at:
+            if total_s > 0:
+                pct = max(0.0, min(100.0, (end_t / total_s) * 100.0))
+                print(f"[whisper] {end_t/3600:.2f}h / {total_s/3600:.2f}h ({pct:.1f}%)", file=sys.stderr, flush=True)
+            else:
+                print(f"[whisper] {end_t/3600:.2f}h", file=sys.stderr, flush=True)
+            next_log_at += log_every_s
+
+        segs_out.append({"start": float(s.start), "end": float(s.end), "text": s.text})
+        txt = (s.text or "").strip()
+        if txt:
+            texts.append(txt)
+
+    ensure_parent_dir(out_txt)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write("\n".join(texts) + "\n")
+
+    ensure_parent_dir(out_json)
+    payload: Dict[str, Any] = {
+        "input": os.path.abspath(input_path),
+        "model": model_name,
+        "device": dev,
+        "compute_type": compute_type,
+        "language": getattr(info, "language", None),
+        "language_probability": getattr(info, "language_probability", None),
+        "duration": getattr(info, "duration", None),
+        "vad_filter": bool(vad_filter),
+        "clip_timestamps": clip_timestamps if isinstance(clip_timestamps, list) else None,
+        "vad_keep": vad_keep if vad_keep is not None else None,
+        "segments": segs_out,
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    dt = time.time() - t0
+    print(f"[done] wrote {out_txt} and {out_json} in {dt/60:.1f} min", file=sys.stderr)
 
 
 # -----------------------------
@@ -880,6 +1002,29 @@ def main() -> None:
     ap.add_argument("--keep-temp", action="store_true", help="Keep intermediate files (in a temp dir) for inspection")
     ap.add_argument("--report-json", default=None, help="Write a JSON report (intervals, settings) to this path")
 
+    # Whisper transcription (end-to-end in this script; no condensed audio output)
+    ap.add_argument("--transcribe", action="store_true",
+                    help="Transcribe INPUT with Whisper and write <out_prefix>.txt/.json (skips prepass/audio rendering).")
+    ap.add_argument("--out-prefix", default=None,
+                    help="Output prefix for transcription files (default: <input_stem>_whisper_<model>).")
+    ap.add_argument("--whisper-model", default="base", help="Whisper model size/name (default: base)")
+    ap.add_argument("--whisper-device", default="auto", choices=["auto", "cpu", "cuda"],
+                    help="Device for Whisper inference (default: auto)")
+    ap.add_argument("--whisper-compute-type", default="auto",
+                    help="CTranslate2 compute type, e.g. auto, int8, int8_float16, float16, float32 (default: auto)")
+    ap.add_argument("--whisper-language", default=None, help="Language code, e.g. en. Default: auto-detect")
+    ap.add_argument("--whisper-task", default="transcribe", choices=["transcribe", "translate"], help="Task (default: transcribe)")
+    ap.add_argument("--whisper-beam-size", type=int, default=5, help="Beam size (default: 5)")
+    ap.set_defaults(whisper_vad_filter=True)
+    ap.add_argument("--whisper-vad-filter", dest="whisper_vad_filter", action="store_true",
+                    help="Enable faster-whisper internal VAD filter (default: enabled)")
+    ap.add_argument("--no-whisper-vad-filter", dest="whisper_vad_filter", action="store_false",
+                    help="Disable faster-whisper internal VAD filter")
+    ap.add_argument("--whisper-log-every", type=float, default=300.0,
+                    help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
+    ap.add_argument("--prevad", action="store_true",
+                    help="In --transcribe mode, run WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables whisper VAD).")
+
     args = ap.parse_args()
 
     input_path = args.input
@@ -936,6 +1081,43 @@ def main() -> None:
         "prepass_keep": [],
         "vad_keep": [],
     }
+
+    if args.transcribe:
+        if args.timestamps_only or args.condense_from_json:
+            die("Cannot combine --transcribe with --timestamps-only/--condense-from-json.")
+        if output_path:
+            die("Do not pass OUTPUT when using --transcribe (it writes .txt/.json files only).")
+
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        out_prefix = args.out_prefix or f"{base}_whisper_{args.whisper_model}"
+
+        vad_keep: Optional[List[Interval]] = None
+        clip_timestamps: List[float] | str = "0"
+        vad_filter = bool(args.whisper_vad_filter)
+
+        if args.prevad:
+            print("[prevad] running WebRTC VAD (ffmpeg PCM stream)", file=sys.stderr)
+            vad_keep = webrtc_vad_speech_segments_streaming_ffmpeg(input_path, dur_s, vad_cfg, webrtc_cfg)
+            if not vad_keep:
+                die("Pre-VAD produced no keep intervals; nothing to transcribe.")
+            clip_timestamps = _intervals_to_clip_timestamps(vad_keep)
+            vad_filter = False
+
+        whisper_transcribe_to_files(
+            input_path=input_path,
+            out_prefix=out_prefix,
+            model_name=args.whisper_model,
+            device=args.whisper_device,
+            compute_type=args.whisper_compute_type,
+            language=args.whisper_language,
+            task=args.whisper_task,
+            beam_size=args.whisper_beam_size,
+            log_every_s=float(args.whisper_log_every),
+            vad_filter=vad_filter,
+            clip_timestamps=clip_timestamps,
+            vad_keep=vad_keep,
+        )
+        return
 
     if args.condense_from_json:
         if args.timestamps_only:
