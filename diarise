@@ -357,7 +357,7 @@ def write_timestamped_transcript(
             abs_s = anchor_dt + timedelta(seconds=start)
             abs_e = anchor_dt + timedelta(seconds=end)
             lines.append(
-                f"[{fmt_dt(abs_s)} -> {fmt_dt(abs_e)}] [{start:8.2f}s -> {end:8.2f}s] {text}"
+                f"[{start:8.2f}s -> {end:8.2f}s] {text}"
             )
         lines.append("")
 
