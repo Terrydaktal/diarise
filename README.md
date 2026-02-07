@@ -4,7 +4,7 @@ Single-command pipeline for long recordings:
 
 - Speech timestamps (VAD) as JSON
 - Optional condensed audio (stitch speech together)
-- Whisper transcription (faster-whisper) to TXT + JSON + a sectioned TXT (default 30 min bins)
+- Whisper transcription (via `faster-whisper`) to TXT + JSON + sectioned/timestamped TXT (default 30 min bins)
 
 Recordings and generated outputs are intentionally ignored by git (see `.gitignore`).
 
@@ -48,9 +48,17 @@ This writes:
 Defaults:
 
 - Whisper model: `--whisper-model base`
-- Whisper device: `--whisper-device cuda` (falls back to CPU if CUDA init fails)
+- Whisper device: `--whisper-device cuda` (falls back to CPU if CUDA init/runtime fails)
+- Whisper language: `--whisper-language en`
+- Whisper compute type: `--whisper-compute-type float16` (CPU falls back to `int8`)
 - faster-whisper internal VAD filter: enabled
 - Sectioned transcript bins: `--section-minutes 30` (set `0` to disable)
+
+Use a different model (e.g. `small`):
+
+```bash
+./diarise Recording.mp3 --whisper-model small
+```
 
 Force CPU:
 
@@ -97,6 +105,19 @@ It can be combined with `--prevad`:
 ./diarise Recording.mp3 --prevad --batched
 ```
 
+Notes:
+
+- Batched mode requires either Whisper VAD (`--whisper-vad-filter`, default) or `--prevad` (clip timestamps). If you disable VAD in batched mode, diarise will retry non-batched.
+- Batched mode decodes the full audio into memory (so very long recordings can be RAM-heavy).
+
+## Postprocess Section Files (`--postprocess-json`)
+
+If you already have `*_whisper_*.json`, you can regenerate the sectioned + timestamped files without re-running Whisper:
+
+```bash
+./diarise Recording.mp3 --postprocess-json Recording_whisper_base.json
+```
+
 ## VAD Timestamps Only (JSON)
 
 Write VAD keep intervals without rendering audio:
@@ -135,4 +156,5 @@ Or render condensed audio from an existing VAD JSON:
 
 - `.hf_cache/` is used for HuggingFace downloads to avoid permission issues with `~/.cache`.
 - If CUDA is not usable on your machine, use `--whisper-device cpu`.
-- Sectioned transcript anchoring uses the earliest available file timestamp from `stat` (Access/Modify/Change/Birth).
+- Sectioned transcript anchoring uses the earliest available file timestamp from `stat` (Access/Modify/Change/Birth) on the original input audio file.
+- Anchor metadata is written into `*_whisper_*.json` as `anchor_file`, `anchor_time`, and `anchor_time_src`.

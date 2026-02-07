@@ -535,15 +535,6 @@ def whisper_transcribe_to_files(
                 ivs = _split_intervals_max_len(ivs, 30.0)
                 clip_dicts = _clip_timestamps_dicts(ivs)
                 vf = False  # ignored when clip_timestamps is set, but keep explicit.
-            else:
-                # Avoid internal VAD in batched mode; if it returns nothing you get an empty transcript.
-                # Instead, explicitly clip to the full audio and rely on batching for speed.
-                if total_s <= 0:
-                    raise RuntimeError("Cannot run --batched: failed to determine input duration")
-                end_s = max(0.0, float(total_s) - 0.1)  # avoid rounding past decoded length
-                ivs = _split_intervals_max_len([(0.0, end_s)], 30.0)
-                clip_dicts = _clip_timestamps_dicts(ivs)
-                vf = False
             return pipe.transcribe(
                 input_path,
                 language=language,
@@ -576,6 +567,34 @@ def whisper_transcribe_to_files(
             model = WhisperModel(model_name, device=dev, compute_type=compute_type)
             segments, info = do_transcribe()
         else:
+            # BatchedInferencePipeline requires either vad_filter=True or clip_timestamps for long audio.
+            # If the user disabled VAD in batched mode, retry using the non-batched pipeline.
+            if batched and "No clip timestamps found" in str(e):
+                print(f"[whisper] batched mode requires VAD; retrying non-batched (vad_filter={vad_filter})", file=sys.stderr)
+                segments, info = model.transcribe(
+                    input_path,
+                    language=language,
+                    task=task,
+                    beam_size=beam_size,
+                    vad_filter=vad_filter,
+                    clip_timestamps=clip_timestamps,
+                )
+            else:
+                raise
+    except AssertionError as e:
+        # BatchedInferencePipeline can assert on some corrupt inputs (e.g. container duration > decodable audio).
+        # Fall back to the non-batched pipeline so the run still completes.
+        if batched:
+            print(f"[whisper] batched pipeline failed ({e}); retrying non-batched", file=sys.stderr)
+            segments, info = model.transcribe(
+                input_path,
+                language=language,
+                task=task,
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+                clip_timestamps=clip_timestamps,
+            )
+        else:
             raise
 
     segs_out: List[Dict[str, Any]] = []
@@ -601,8 +620,12 @@ def whisper_transcribe_to_files(
         f.write("\n".join(texts) + "\n")
 
     ensure_parent_dir(out_json)
+    anchor_dt, anchor_src = get_file_anchor_time(input_path)
     payload: Dict[str, Any] = {
         "input": os.path.abspath(input_path),
+        "anchor_file": os.path.abspath(input_path),
+        "anchor_time": anchor_dt.isoformat(timespec="seconds"),
+        "anchor_time_src": anchor_src,
         "model": model_name,
         "device": dev,
         "compute_type": compute_type,
@@ -1366,6 +1389,8 @@ def main() -> None:
                     help="Write <out_prefix>_sectioned.txt and <out_prefix>_timestamped.txt with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--prevad", action="store_true",
                     help="In transcription mode, run dead-air prepass + WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables whisper VAD).")
+    ap.add_argument("--postprocess-json", default=None,
+                    help="Skip transcription and (re)generate *_sectioned.txt and *_timestamped.txt from an existing diarise Whisper JSON output.")
 
     args = ap.parse_args()
 
@@ -1374,6 +1399,26 @@ def main() -> None:
 
     if not os.path.isfile(input_path):
         die(f"Input file not found: {input_path}")
+
+    if args.postprocess_json:
+        if int(args.section_minutes) <= 0:
+            die("--postprocess-json requires --section-minutes > 0")
+        try:
+            with open(args.postprocess_json, "r", encoding="utf-8") as f:
+                j = json.load(f)
+        except OSError as e:
+            die(f"Failed to read JSON: {e}")
+        segs = j.get("segments")
+        if not isinstance(segs, list):
+            die("Invalid JSON: expected a top-level key 'segments' (list)")
+
+        out_prefix = os.path.splitext(os.path.abspath(args.postprocess_json))[0]
+        out_sectioned = f"{out_prefix}_sectioned.txt"
+        out_timestamped = f"{out_prefix}_timestamped.txt"
+        write_sectioned_transcript(out_path=out_sectioned, anchor_file=input_path, segments=segs, bin_minutes=int(args.section_minutes))
+        write_timestamped_transcript(out_path=out_timestamped, anchor_file=input_path, segments=segs, bin_minutes=int(args.section_minutes))
+        print(f"[done] wrote {out_sectioned} and {out_timestamped}", file=sys.stderr)
+        return
 
     dur_s = ffprobe_duration_seconds(input_path)
     print(f"[info] input duration: {dur_s/3600:.2f} hours", file=sys.stderr)

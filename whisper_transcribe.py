@@ -794,24 +794,42 @@ def main() -> None:
         if isinstance(clip_timestamps, list):
             clip_dicts = clip_timestamps_dicts_from_flat(clip_timestamps)
             vf = False  # ignored when clip_timestamps is set, but keep explicit.
-        else:
-            # Avoid internal VAD in batched mode; it can return nothing on some inputs.
-            # Instead, explicitly clip to the full audio and rely on batching for speed.
-            if total_s <= 0:
-                die("Cannot run --batched: failed to determine input duration")
-            end_s = max(0.0, float(total_s) - 0.1)  # avoid rounding past decoded length
-            clip_dicts = clip_timestamps_dicts_from_flat([0.0, end_s])
-            vf = False
-        segments, info = pipe.transcribe(
-            in_path,
-            language=args.language,
-            task=args.task,
-            beam_size=args.beam_size,
-            vad_filter=vf,
-            clip_timestamps=clip_dicts,
-            without_timestamps=False,
-            batch_size=16,
-        )
+        try:
+            segments, info = pipe.transcribe(
+                in_path,
+                language=args.language,
+                task=args.task,
+                beam_size=args.beam_size,
+                vad_filter=vf,
+                clip_timestamps=clip_dicts,
+                without_timestamps=False,
+                batch_size=16,
+            )
+        except RuntimeError as e:
+            # BatchedInferencePipeline requires either vad_filter=True or clip_timestamps for long audio.
+            if "No clip timestamps found" in str(e):
+                print(f"[warn] --batched requires VAD; retrying non-batched (vad_filter={vad_filter})", file=sys.stderr)
+                segments, info = model.transcribe(
+                    in_path,
+                    language=args.language,
+                    task=args.task,
+                    beam_size=args.beam_size,
+                    vad_filter=vad_filter,
+                    clip_timestamps=clip_timestamps,
+                )
+            else:
+                raise
+        except AssertionError as e:
+            # BatchedInferencePipeline can assert on some corrupt inputs (e.g. container duration > decodable audio).
+            print(f"[warn] batched pipeline failed ({e}); retrying non-batched", file=sys.stderr)
+            segments, info = model.transcribe(
+                in_path,
+                language=args.language,
+                task=args.task,
+                beam_size=args.beam_size,
+                vad_filter=vad_filter,
+                clip_timestamps=clip_timestamps,
+            )
     else:
         segments, info = model.transcribe(
             in_path,
@@ -856,8 +874,25 @@ def main() -> None:
         f.write("\n".join([t for t in texts if t]) + "\n")
 
     ensure_parent_dir(out_json)
+    # Anchor timestamps for sectioned/timestamped output (and record it in JSON).
+    anchor_file = in_path
+    if args.anchor_file:
+        anchor_file = args.anchor_file
+    elif map_orig_input and os.path.isfile(map_orig_input):
+        anchor_file = map_orig_input
+    elif args.diarise_report:
+        anchor_file = load_diarise_anchor_file(args.diarise_report)
+    else:
+        guessed = guess_diarise_report_for_input(in_path)
+        if guessed:
+            anchor_file = load_diarise_anchor_file(guessed)
+    anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+
     payload: Dict[str, Any] = {
         "input": os.path.abspath(in_path),
+        "anchor_file": os.path.abspath(anchor_file),
+        "anchor_time": anchor_dt.isoformat(timespec="seconds"),
+        "anchor_time_src": anchor_src,
         "model": args.model,
         "device": device,
         "compute_type": args.compute_type,
@@ -881,18 +916,6 @@ def main() -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
     try:
-        anchor_file = in_path
-        if args.anchor_file:
-            anchor_file = args.anchor_file
-        elif map_orig_input and os.path.isfile(map_orig_input):
-            anchor_file = map_orig_input
-        elif args.diarise_report:
-            anchor_file = load_diarise_anchor_file(args.diarise_report)
-        else:
-            guessed = guess_diarise_report_for_input(in_path)
-            if guessed:
-                anchor_file = load_diarise_anchor_file(guessed)
-
         write_sectioned_transcript(out_path=out_sectioned, anchor_file=anchor_file, segments=segs_out, bin_minutes=args.section_minutes)
         write_timestamped_transcript(out_path=out_timestamped, anchor_file=anchor_file, segments=segs_out, bin_minutes=args.section_minutes)
     except Exception as e:
