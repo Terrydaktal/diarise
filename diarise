@@ -157,6 +157,29 @@ def ffprobe_duration_seconds(path: str) -> float:
     except ValueError:
         die(f"ffprobe returned non-numeric duration: {s}")
 
+def ffprobe_audio_params(path: str) -> Tuple[int, int]:
+    """
+    Returns (sample_rate_hz, channels) for the first audio stream.
+    """
+    cp = run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate,channels",
+        "-of", "json",
+        path
+    ], capture=True)
+    try:
+        j = json.loads(cp.stdout or "{}")
+        streams = j.get("streams") or []
+        if not streams:
+            raise ValueError("no audio streams")
+        s = streams[0]
+        sr = int(s.get("sample_rate"))
+        ch = int(s.get("channels"))
+        return sr, ch
+    except Exception as e:
+        die(f"ffprobe could not read audio params: {e}")
+
 def ensure_parent_dir(path: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.isdir(d):
@@ -851,6 +874,8 @@ def main() -> None:
     # Rendering / output
     ap.add_argument("--timestamps-only", action="store_true",
                     help="Only detect speech timestamps and write JSON (skips prepass and audio rendering).")
+    ap.add_argument("--condense-from-json", default=None,
+                    help="Read keep intervals from a JSON report (expects key 'vad_keep') and render OUTPUT from INPUT.")
     ap.add_argument("--fade", type=float, default=0.02, help="Fade duration at cut points (seconds) (default: 0.02)")
     ap.add_argument("--keep-temp", action="store_true", help="Keep intermediate files (in a temp dir) for inspection")
     ap.add_argument("--report-json", default=None, help="Write a JSON report (intervals, settings) to this path")
@@ -911,6 +936,49 @@ def main() -> None:
         "prepass_keep": [],
         "vad_keep": [],
     }
+
+    if args.condense_from_json:
+        if args.timestamps_only:
+            die("Cannot use --timestamps-only and --condense-from-json together.")
+        if not output_path:
+            die("Missing required output path (provide OUTPUT).")
+        try:
+            with open(args.condense_from_json, "r", encoding="utf-8") as f:
+                j = json.load(f)
+        except OSError as e:
+            die(f"Failed to read JSON: {e}")
+        keep = j.get("vad_keep")
+        if not isinstance(keep, list) or not keep:
+            die("JSON does not contain a non-empty 'vad_keep' list.")
+        try:
+            keep_intervals: List[Interval] = [(float(s), float(e)) for s, e in keep]
+        except Exception:
+            die("Invalid interval format in 'vad_keep' (expected [[start,end], ...]).")
+
+        # Preserve input sampling rate/channels explicitly so output matches original.
+        in_sr, in_ch = ffprobe_audio_params(input_path)
+        codec, extra = guess_codec_from_ext(output_path)
+        extra2 = list(extra) + ["-ar", str(in_sr), "-ac", str(in_ch)]
+
+        print(f"[render] rendering final output from JSON -> {output_path}", file=sys.stderr)
+        ffmpeg_render_keep_intervals(
+            input_path,
+            keep_intervals,
+            output_path,
+            fade_s=args.fade,
+            audio_codec=codec,
+            extra_args=extra2,
+        )
+
+        if args.report_json:
+            report["vad_keep"] = keep_intervals
+            ensure_parent_dir(args.report_json)
+            with open(args.report_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            print(f"[info] wrote report: {args.report_json}", file=sys.stderr)
+
+        print("[done]", file=sys.stderr)
+        return
 
     if args.timestamps_only:
         report_path = args.report_json
