@@ -213,6 +213,69 @@ def write_sectioned_transcript(
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines).rstrip() + "\n")
 
+def write_timestamped_transcript(
+    *,
+    out_path: str,
+    anchor_file: str,
+    segments: list[dict[str, Any]],
+    bin_minutes: int,
+) -> None:
+    if bin_minutes <= 0:
+        return
+
+    anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    bin_s = float(bin_minutes) * 60.0
+
+    bins: dict[int, list[dict[str, Any]]] = {}
+    max_i = 0
+    for s in segments:
+        try:
+            start = float(s["start"])
+        except Exception:
+            continue
+        i = int(start // bin_s) if start > 0 else 0
+        max_i = max(max_i, i)
+        bins.setdefault(i, []).append(s)
+
+    def fmt_dt(dt: datetime) -> str:
+        return dt.isoformat(timespec="seconds")
+
+    lines: list[str] = []
+    lines.append(f"# Transcript (timestamped, {bin_minutes} min bins)")
+    lines.append(f"# anchor_file: {os.path.abspath(anchor_file)}")
+    lines.append(f"# anchor_time: {fmt_dt(anchor_dt)} ({anchor_src})")
+    lines.append("")
+
+    for i in range(0, max_i + 1):
+        bin_start_s = i * bin_s
+        bin_end_s = (i + 1) * bin_s
+        abs_start = anchor_dt + timedelta(seconds=bin_start_s)
+        abs_end = anchor_dt + timedelta(seconds=bin_end_s)
+        lines.append(
+            f"## {fmt_dt(abs_start)} to {fmt_dt(abs_end)}  (t={bin_start_s/3600:.2f}h to {bin_end_s/3600:.2f}h)"
+        )
+        seg_list = sorted(bins.get(i, []), key=lambda x: (float(x.get("start", 0.0)), float(x.get("end", 0.0))))
+        if not seg_list:
+            lines.append("[no transcript in this window]")
+            lines.append("")
+            continue
+        for s in seg_list:
+            start = float(s["start"])
+            end = float(s["end"])
+            text = str(s.get("text", "")).strip()
+            if not text:
+                continue
+            abs_s = anchor_dt + timedelta(seconds=start)
+            abs_e = anchor_dt + timedelta(seconds=end)
+            lines.append(
+                f"[{fmt_dt(abs_s)} -> {fmt_dt(abs_e)}] [{start:8.2f}s -> {end:8.2f}s] {text}"
+            )
+        lines.append("")
+
+    ensure_parent_dir(out_path)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
+
 def merge_intervals(intervals: list[tuple[float, float]], gap: float) -> list[tuple[float, float]]:
     if not intervals:
         return []
@@ -557,7 +620,7 @@ def main() -> None:
                     help="Map timestamps from a condensed stitched file back to original time using a prevad JSON report (with timeline_map).")
     ap.add_argument("--log-every", type=float, default=300.0, help="Progress log interval seconds (default: 300)")
     ap.add_argument("--section-minutes", type=int, default=30,
-                    help="Also write a timestamped transcript (*_timestamped.txt) with this bin size (default: 30). Set 0 to disable.")
+                    help="Also write *_sectioned.txt and *_timestamped.txt with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--anchor-file", default=None,
                     help="File whose filesystem time anchors the section timestamps (default: INPUT).")
     ap.add_argument("--diarise-report", default=None,
@@ -581,7 +644,8 @@ def main() -> None:
 
     out_txt = f"{out_prefix}.txt"
     out_json = f"{out_prefix}.json"
-    out_sectioned = f"{out_prefix}_timestamped.txt"
+    out_sectioned = f"{out_prefix}_sectioned.txt"
+    out_timestamped = f"{out_prefix}_timestamped.txt"
 
     total_s = 0.0
     try:
@@ -771,18 +835,14 @@ def main() -> None:
             if guessed:
                 anchor_file = load_diarise_anchor_file(guessed)
 
-        write_sectioned_transcript(
-            out_path=out_sectioned,
-            anchor_file=anchor_file,
-            segments=segs_out,
-            bin_minutes=args.section_minutes,
-        )
+        write_sectioned_transcript(out_path=out_sectioned, anchor_file=anchor_file, segments=segs_out, bin_minutes=args.section_minutes)
+        write_timestamped_transcript(out_path=out_timestamped, anchor_file=anchor_file, segments=segs_out, bin_minutes=args.section_minutes)
     except Exception as e:
-        print(f"[warn] failed to write sectioned transcript: {e}", file=sys.stderr)
+        print(f"[warn] failed to write sectioned/timestamped transcript: {e}", file=sys.stderr)
 
     dt = time.time() - t0
     if args.section_minutes > 0:
-        print(f"[done] wrote {out_txt}, {out_json}, {out_sectioned} in {dt/60:.1f} min", file=sys.stderr)
+        print(f"[done] wrote {out_txt}, {out_json}, {out_sectioned}, {out_timestamped} in {dt/60:.1f} min", file=sys.stderr)
     else:
         print(f"[done] wrote {out_txt} and {out_json} in {dt/60:.1f} min", file=sys.stderr)
 

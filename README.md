@@ -42,6 +42,7 @@ This writes:
 
 - `Recording_whisper_base.txt`
 - `Recording_whisper_base.json`
+- `Recording_whisper_base_sectioned.txt`
 - `Recording_whisper_base_timestamped.txt`
 
 Defaults:
