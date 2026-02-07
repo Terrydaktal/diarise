@@ -33,12 +33,13 @@ diarise_run.log
 *.log
 *.err
 *.json
-
-# Transcription outputs
 *.srt
 *.vtt
 *.tsv
 *.txt
+
+# Misc
+*.flac
 
 # Local model/cache
 .hf_cache/

@@ -83,6 +83,20 @@ If you need to inspect intermediates:
 ./diarise Recording.mp3 --prevad --keep-temp
 ```
 
+## Batched Transcription (`--batched`)
+
+Enable faster-whisper’s `BatchedInferencePipeline` with `batch_size=16`:
+
+```bash
+./diarise Recording.mp3 --batched
+```
+
+It can be combined with `--prevad`:
+
+```bash
+./diarise Recording.mp3 --prevad --batched
+```
+
 ## VAD Timestamps Only (JSON)
 
 Write VAD keep intervals without rendering audio:
