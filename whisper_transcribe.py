@@ -26,6 +26,13 @@ def die(msg: str, code: int = 1) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     raise SystemExit(code)
 
+def configure_hf_cache() -> None:
+    # HuggingFace Hub defaults to ~/.cache/huggingface; in some environments this path can be
+    # non-writable (e.g. created by another user/root). Use a repo-local cache by default.
+    if "HF_HOME" not in os.environ:
+        repo_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf_cache")
+        os.environ["HF_HOME"] = repo_cache
+
 def ffprobe_duration_seconds(path: str) -> float:
     try:
         cp = subprocess.run(
@@ -57,6 +64,8 @@ def ensure_parent_dir(path: str) -> None:
 
 
 def main() -> None:
+    configure_hf_cache()
+
     ap = argparse.ArgumentParser(description="Transcribe audio using Whisper via faster-whisper.")
     ap.add_argument("input", help="Input audio/video file (any format ffmpeg can read)")
     ap.add_argument("--model", default="base", help="Whisper model size/name (default: base)")
