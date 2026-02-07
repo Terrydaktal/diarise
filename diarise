@@ -1061,14 +1061,12 @@ def main() -> None:
     ap.add_argument("--keep-temp", action="store_true", help="Keep intermediate files (in a temp dir) for inspection")
     ap.add_argument("--report-json", default=None, help="Write a JSON report (intervals, settings) to this path")
 
-    # Whisper transcription (end-to-end in this script; no condensed audio output)
-    ap.add_argument("--transcribe", action="store_true",
-                    help="Transcribe INPUT with Whisper and write <out_prefix>.txt/.json (skips prepass/audio rendering).")
+    # Whisper transcription (end-to-end in this script; default mode when OUTPUT is omitted)
     ap.add_argument("--out-prefix", default=None,
                     help="Output prefix for transcription files (default: <input_stem>_whisper_<model>).")
     ap.add_argument("--whisper-model", default="base", help="Whisper model size/name (default: base)")
-    ap.add_argument("--whisper-device", default="auto", choices=["auto", "cpu", "cuda"],
-                    help="Device for Whisper inference (default: auto)")
+    ap.add_argument("--whisper-device", default="cuda", choices=["auto", "cpu", "cuda"],
+                    help="Device for Whisper inference (default: cuda)")
     ap.add_argument("--whisper-compute-type", default="auto",
                     help="CTranslate2 compute type, e.g. auto, int8, int8_float16, float16, float32 (default: auto)")
     ap.add_argument("--whisper-language", default=None, help="Language code, e.g. en. Default: auto-detect")
@@ -1082,7 +1080,7 @@ def main() -> None:
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--prevad", action="store_true",
-                    help="In --transcribe mode, run WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables whisper VAD).")
+                    help="In transcription mode, run dead-air prepass + WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables whisper VAD).")
 
     args = ap.parse_args()
 
@@ -1141,11 +1139,9 @@ def main() -> None:
         "vad_keep": [],
     }
 
-    if args.transcribe:
-        if args.timestamps_only or args.condense_from_json:
-            die("Cannot combine --transcribe with --timestamps-only/--condense-from-json.")
-        if output_path:
-            die("Do not pass OUTPUT when using --transcribe (it writes .txt/.json files only).")
+    # Default mode: if OUTPUT is omitted (and we're not in the explicit VAD/condense modes),
+    # run Whisper transcription and write <out_prefix>.txt/.json.
+    if (output_path is None) and (not args.timestamps_only) and (not args.condense_from_json):
 
         base = os.path.splitext(os.path.basename(input_path))[0]
         out_prefix = args.out_prefix or f"{base}_whisper_{args.whisper_model}"

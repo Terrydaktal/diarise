@@ -60,19 +60,24 @@ Notes:
 
 ### Whisper transcription (TXT + JSON)
 
-Transcribe an input to `<out_prefix>.txt` and `<out_prefix>.json`:
+By default, running `./diarise` with only an input will transcribe to `<out_prefix>.txt` and `<out_prefix>.json`:
 
 ```bash
 . .venv/bin/activate
-./diarise Recording.mp3 --transcribe --whisper-model base --whisper-device cpu --whisper-compute-type int8
+./diarise Recording.mp3
 ```
 
-By default, this uses faster-whisper’s built-in `vad_filter` (enabled) and does **not** do any external preprocessing.
+Defaults:
+
+- `--whisper-model base`
+- `--whisper-device cuda` (falls back to CPU if CUDA init fails)
+- faster-whisper built-in `vad_filter` enabled
+- no external preprocessing
 
 If you want a fast prepass to skip silence, add `--prevad` (WebRTC VAD) which feeds `clip_timestamps` to Whisper:
 
 ```bash
-./diarise Recording.mp3 --transcribe --prevad --whisper-model base --whisper-device cpu --whisper-compute-type int8
+./diarise Recording.mp3 --prevad
 ```
 
 ## `whisper_transcribe.py` (Optional)
