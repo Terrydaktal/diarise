@@ -656,15 +656,25 @@ def _prevad_render_condensed_audio(
     report_json_path: str,
     condensed_out: str,
 ) -> None:
-    # Use the current interpreter so diarise sees the same venv deps.
-    cmd = [
-        sys.executable,
-        diarise_path,
-        input_path,
-        condensed_out,
-        "--condense-from-json",
-        report_json_path,
-    ]
+    # `diarise_path` is expected to be an executable wrapper (bash) next to this script.
+    # If it's a .py script, run it with the current interpreter.
+    if diarise_path.endswith(".py"):
+        cmd = [
+            sys.executable,
+            diarise_path,
+            input_path,
+            condensed_out,
+            "--condense-from-json",
+            report_json_path,
+        ]
+    else:
+        cmd = [
+            diarise_path,
+            input_path,
+            condensed_out,
+            "--condense-from-json",
+            report_json_path,
+        ]
     subprocess.run(cmd, check=True)
 
 
