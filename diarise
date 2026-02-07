@@ -42,7 +42,7 @@ import wave
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 from datetime import timedelta
 
 import numpy as np
@@ -393,6 +393,24 @@ def _intervals_to_clip_timestamps(intervals: List[Interval]) -> List[float]:
             clip.extend([float(s), float(e)])
     return clip
 
+def _split_intervals_max_len(intervals: List[Interval], max_len_s: float) -> List[Interval]:
+    if max_len_s <= 0:
+        return intervals
+    out: List[Interval] = []
+    for s0, e0 in intervals:
+        s = float(s0)
+        e = float(e0)
+        if e <= s:
+            continue
+        while (e - s) > max_len_s:
+            out.append((s, s + max_len_s))
+            s += max_len_s
+        out.append((s, e))
+    return out
+
+def _clip_timestamps_dicts(intervals: List[Interval]) -> List[Dict[str, float]]:
+    return [{"start": float(s), "end": float(e)} for s, e in intervals if e > s]
+
 def _build_stitch_chunks(keep_intervals: List[Interval]) -> tuple[List[Dict[str, float]], float]:
     """
     Given intervals in the ORIGINAL timeline that are stitched back-to-back into a new file,
@@ -465,6 +483,7 @@ def whisper_transcribe_to_files(
     vad_keep: Optional[List[Interval]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
     section_minutes: int = 30,
+    batched: bool = False,
 ) -> None:
     configure_hf_cache()
 
@@ -502,9 +521,41 @@ def whisper_transcribe_to_files(
         else:
             raise
 
-    t0 = time.time()
-    try:
-        segments, info = model.transcribe(
+    def do_transcribe() -> Tuple[Iterable[Any], Any]:
+        if batched:
+            from faster_whisper.transcribe import BatchedInferencePipeline
+
+            pipe = BatchedInferencePipeline(model)
+            clip_dicts = None
+            vf = vad_filter
+            if isinstance(clip_timestamps, list):
+                # Batched pipeline expects clip_timestamps as [{"start":s,"end":e}, ...] in seconds.
+                ivs = [(float(clip_timestamps[i]), float(clip_timestamps[i + 1])) for i in range(0, len(clip_timestamps), 2)]
+                # Batched pipeline will truncate segments > chunk_length (default 30s). Split to be safe.
+                ivs = _split_intervals_max_len(ivs, 30.0)
+                clip_dicts = _clip_timestamps_dicts(ivs)
+                vf = False  # ignored when clip_timestamps is set, but keep explicit.
+            else:
+                # Avoid internal VAD in batched mode; if it returns nothing you get an empty transcript.
+                # Instead, explicitly clip to the full audio and rely on batching for speed.
+                if total_s <= 0:
+                    raise RuntimeError("Cannot run --batched: failed to determine input duration")
+                end_s = max(0.0, float(total_s) - 0.1)  # avoid rounding past decoded length
+                ivs = _split_intervals_max_len([(0.0, end_s)], 30.0)
+                clip_dicts = _clip_timestamps_dicts(ivs)
+                vf = False
+            return pipe.transcribe(
+                input_path,
+                language=language,
+                task=task,
+                beam_size=beam_size,
+                vad_filter=vf,
+                clip_timestamps=clip_dicts,
+                without_timestamps=False,
+                batch_size=16,
+            )
+
+        return model.transcribe(
             input_path,
             language=language,
             task=task,
@@ -512,6 +563,10 @@ def whisper_transcribe_to_files(
             vad_filter=vad_filter,
             clip_timestamps=clip_timestamps,
         )
+
+    t0 = time.time()
+    try:
+        segments, info = do_transcribe()
     except RuntimeError as e:
         # Some CUDA setups can initialize but fail when the first GEMM runs (e.g. cuBLAS errors).
         if dev == "cuda":
@@ -519,14 +574,7 @@ def whisper_transcribe_to_files(
             dev = "cpu"
             compute_type = _whisper_cpu_compute_type(compute_type)
             model = WhisperModel(model_name, device=dev, compute_type=compute_type)
-            segments, info = model.transcribe(
-                input_path,
-                language=language,
-                task=task,
-                beam_size=beam_size,
-                vad_filter=vad_filter,
-                clip_timestamps=clip_timestamps,
-            )
+            segments, info = do_transcribe()
         else:
             raise
 
@@ -561,6 +609,8 @@ def whisper_transcribe_to_files(
         "language": getattr(info, "language", None),
         "language_probability": getattr(info, "language_probability", None),
         "duration": getattr(info, "duration", None),
+        "batched": bool(batched),
+        "batch_size": 16 if batched else None,
         "vad_filter": bool(vad_filter),
         "clip_timestamps": clip_timestamps if isinstance(clip_timestamps, list) else None,
         "vad_keep": vad_keep if vad_keep is not None else None,
@@ -1310,6 +1360,8 @@ def main() -> None:
                     help="Disable faster-whisper internal VAD filter")
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
+    ap.add_argument("--batched", action="store_true",
+                    help="Use faster-whisper BatchedInferencePipeline (batch_size=16).")
     ap.add_argument("--section-minutes", type=int, default=30,
                     help="Write <out_prefix>_sectioned.txt and <out_prefix>_timestamped.txt with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--prevad", action="store_true",
@@ -1448,6 +1500,7 @@ def main() -> None:
             vad_keep=vad_keep,
             extra_payload=extra_payload,
             section_minutes=int(args.section_minutes),
+            batched=bool(args.batched),
         )
         return
 

@@ -303,6 +303,32 @@ def clamp_intervals(intervals: list[tuple[float, float]], lo: float, hi: float) 
 def drop_short(intervals: list[tuple[float, float]], min_len: float) -> list[tuple[float, float]]:
     return [(s, e) for s, e in intervals if (e - s) >= min_len]
 
+def split_intervals_max_len(intervals: list[tuple[float, float]], max_len_s: float) -> list[tuple[float, float]]:
+    if max_len_s <= 0:
+        return intervals
+    out: list[tuple[float, float]] = []
+    for s0, e0 in intervals:
+        s = float(s0)
+        e = float(e0)
+        if e <= s:
+            continue
+        while (e - s) > max_len_s:
+            out.append((s, s + max_len_s))
+            s += max_len_s
+        out.append((s, e))
+    return out
+
+def clip_timestamps_dicts_from_flat(clip_timestamps: list[float]) -> list[dict[str, float]]:
+    ivs: list[tuple[float, float]] = []
+    for i in range(0, len(clip_timestamps), 2):
+        try:
+            ivs.append((float(clip_timestamps[i]), float(clip_timestamps[i + 1])))
+        except Exception:
+            continue
+    # BatchedInferencePipeline truncates segments longer than chunk_length (default 30s). Split to be safe.
+    ivs = split_intervals_max_len(ivs, 30.0)
+    return [{"start": s, "end": e} for s, e in ivs if e > s]
+
 def webrtc_vad_clip_timestamps(
     *,
     input_path: str,
@@ -601,6 +627,8 @@ def main() -> None:
                     help="Disable faster-whisper's internal VAD filter")
     ap.add_argument("--prevad", action="store_true",
                     help="Run WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables built-in VAD).")
+    ap.add_argument("--batched", action="store_true",
+                    help="Use faster-whisper BatchedInferencePipeline (batch_size=16).")
     ap.add_argument("--prevad-gap-cut", type=float, default=10.0,
                     help="In --prevad mode, merge speech across gaps <= this many seconds (default: 10)")
     ap.add_argument("--prevad-pad-pre", type=float, default=0.35, help="In --prevad mode, pad before speech (default: 0.35s)")
@@ -757,14 +785,42 @@ def main() -> None:
                 print("[warn] prevad preprocessing skipped: diarise script not found next to whisper_transcribe.py", file=sys.stderr)
 
     t0 = time.time()
-    segments, info = model.transcribe(
-        in_path,
-        language=args.language,
-        task=args.task,
-        beam_size=args.beam_size,
-        vad_filter=vad_filter,
-        clip_timestamps=clip_timestamps,
-    )
+    if args.batched:
+        from faster_whisper.transcribe import BatchedInferencePipeline
+
+        pipe = BatchedInferencePipeline(model)
+        clip_dicts = None
+        vf = vad_filter
+        if isinstance(clip_timestamps, list):
+            clip_dicts = clip_timestamps_dicts_from_flat(clip_timestamps)
+            vf = False  # ignored when clip_timestamps is set, but keep explicit.
+        else:
+            # Avoid internal VAD in batched mode; it can return nothing on some inputs.
+            # Instead, explicitly clip to the full audio and rely on batching for speed.
+            if total_s <= 0:
+                die("Cannot run --batched: failed to determine input duration")
+            end_s = max(0.0, float(total_s) - 0.1)  # avoid rounding past decoded length
+            clip_dicts = clip_timestamps_dicts_from_flat([0.0, end_s])
+            vf = False
+        segments, info = pipe.transcribe(
+            in_path,
+            language=args.language,
+            task=args.task,
+            beam_size=args.beam_size,
+            vad_filter=vf,
+            clip_timestamps=clip_dicts,
+            without_timestamps=False,
+            batch_size=16,
+        )
+    else:
+        segments, info = model.transcribe(
+            in_path,
+            language=args.language,
+            task=args.task,
+            beam_size=args.beam_size,
+            vad_filter=vad_filter,
+            clip_timestamps=clip_timestamps,
+        )
 
     segs_out: List[Dict[str, Any]] = []
     texts: List[str] = []
@@ -808,6 +864,8 @@ def main() -> None:
         "language": getattr(info, "language", None),
         "language_probability": getattr(info, "language_probability", None),
         "duration": getattr(info, "duration", None),
+        "batched": bool(args.batched),
+        "batch_size": 16 if args.batched else None,
         "prevad": bool(args.prevad),
         "prevad_no_preprocess": bool(args.prevad_no_preprocess),
         "prevad_report_json": os.path.abspath(prevad_report_json_path) if prevad_report_json_path else None,
