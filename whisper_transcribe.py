@@ -855,6 +855,13 @@ def main() -> None:
             else:
                 print("[warn] prevad preprocessing skipped: diarise script not found next to whisper_transcribe.py", file=sys.stderr)
 
+    vad_parameters = None
+    if vad_filter and (not isinstance(clip_timestamps, list)):
+        vad_parameters = {
+            "threshold": 0.4,
+            "min_silence_duration_ms": 2000,
+        }
+
     t0 = time.time()
     if args.batched:
         from faster_whisper.transcribe import BatchedInferencePipeline
@@ -872,6 +879,7 @@ def main() -> None:
                 task=args.task,
                 beam_size=args.beam_size,
                 vad_filter=vf,
+                vad_parameters=vad_parameters if vf else None,
                 clip_timestamps=clip_dicts,
                 without_timestamps=False,
                 batch_size=16,
@@ -886,6 +894,7 @@ def main() -> None:
                     task=args.task,
                     beam_size=args.beam_size,
                     vad_filter=vad_filter,
+                    vad_parameters=vad_parameters if vad_filter else None,
                     clip_timestamps=clip_timestamps,
                 )
             else:
@@ -899,6 +908,7 @@ def main() -> None:
                 task=args.task,
                 beam_size=args.beam_size,
                 vad_filter=vad_filter,
+                vad_parameters=vad_parameters if vad_filter else None,
                 clip_timestamps=clip_timestamps,
             )
     else:
@@ -908,6 +918,7 @@ def main() -> None:
             task=args.task,
             beam_size=args.beam_size,
             vad_filter=vad_filter,
+            vad_parameters=vad_parameters if vad_filter else None,
             clip_timestamps=clip_timestamps,
         )
 

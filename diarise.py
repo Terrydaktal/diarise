@@ -528,6 +528,7 @@ def whisper_transcribe_to_files(
     extra_payload: Optional[Dict[str, Any]] = None,
     section_minutes: int = 30,
     batched: bool = False,
+    batch_size: int = 16,
 ) -> None:
     configure_hf_cache()
 
@@ -565,6 +566,15 @@ def whisper_transcribe_to_files(
         else:
             raise
 
+    # faster-whisper built-in Silero VAD defaults to threshold=0.5 and (in batched mode) min_silence_duration_ms=160.
+    # We override these to be more sensitive and keep behavior consistent between batched and non-batched.
+    vad_parameters = None
+    if vad_filter and (not isinstance(clip_timestamps, list)):
+        vad_parameters = {
+            "threshold": 0.4,
+            "min_silence_duration_ms": 2000,
+        }
+
     def do_transcribe() -> Tuple[Iterable[Any], Any]:
         if batched:
             from faster_whisper.transcribe import BatchedInferencePipeline
@@ -585,9 +595,10 @@ def whisper_transcribe_to_files(
                 task=task,
                 beam_size=beam_size,
                 vad_filter=vf,
+                vad_parameters=vad_parameters if vf else None,
                 clip_timestamps=clip_dicts,
                 without_timestamps=False,
-                batch_size=16,
+                batch_size=int(batch_size),
             )
 
         return model.transcribe(
@@ -596,8 +607,13 @@ def whisper_transcribe_to_files(
             task=task,
             beam_size=beam_size,
             vad_filter=vad_filter,
+            vad_parameters=vad_parameters if vad_filter else None,
             clip_timestamps=clip_timestamps,
         )
+
+    def _is_cuda_oom(e: BaseException) -> bool:
+        s = str(e).lower()
+        return ("out of memory" in s) or ("cublas_status_alloc_failed" in s)
 
     t0 = time.time()
     try:
@@ -605,6 +621,11 @@ def whisper_transcribe_to_files(
     except RuntimeError as e:
         # Some CUDA setups can initialize but fail when the first GEMM runs (e.g. cuBLAS errors).
         if dev == "cuda":
+            if batched and _is_cuda_oom(e):
+                die(
+                    "CUDA out of memory in --batched mode. Re-run with a smaller --batch-size "
+                    "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
+                )
             print(f"[whisper] CUDA runtime failed ({e}); falling back to CPU", file=sys.stderr)
             dev = "cpu"
             compute_type = _whisper_cpu_compute_type(compute_type)
@@ -621,6 +642,7 @@ def whisper_transcribe_to_files(
                     task=task,
                     beam_size=beam_size,
                     vad_filter=vad_filter,
+                    vad_parameters=vad_parameters if vad_filter else None,
                     clip_timestamps=clip_timestamps,
                 )
             else:
@@ -636,6 +658,7 @@ def whisper_transcribe_to_files(
                 task=task,
                 beam_size=beam_size,
                 vad_filter=vad_filter,
+                vad_parameters=vad_parameters if vad_filter else None,
                 clip_timestamps=clip_timestamps,
             )
         else:
@@ -644,20 +667,28 @@ def whisper_transcribe_to_files(
     segs_out: List[Dict[str, Any]] = []
     texts: List[str] = []
     next_log_at = log_every_s if log_every_s > 0 else float("inf")
-    for s in segments:
-        end_t = float(s.end)
-        if end_t >= next_log_at:
-            if total_s > 0:
-                pct = max(0.0, min(100.0, (end_t / total_s) * 100.0))
-                print(f"[whisper] {end_t/3600:.2f}h / {total_s/3600:.2f}h ({pct:.1f}%)", file=sys.stderr, flush=True)
-            else:
-                print(f"[whisper] {end_t/3600:.2f}h", file=sys.stderr, flush=True)
-            next_log_at += log_every_s
+    try:
+        for s in segments:
+            end_t = float(s.end)
+            if end_t >= next_log_at:
+                if total_s > 0:
+                    pct = max(0.0, min(100.0, (end_t / total_s) * 100.0))
+                    print(f"[whisper] {end_t/3600:.2f}h / {total_s/3600:.2f}h ({pct:.1f}%)", file=sys.stderr, flush=True)
+                else:
+                    print(f"[whisper] {end_t/3600:.2f}h", file=sys.stderr, flush=True)
+                next_log_at += log_every_s
 
-        segs_out.append({"start": float(s.start), "end": float(s.end), "text": s.text})
-        txt = (s.text or "").strip()
-        if txt:
-            texts.append(txt)
+            segs_out.append({"start": float(s.start), "end": float(s.end), "text": s.text})
+            txt = (s.text or "").strip()
+            if txt:
+                texts.append(txt)
+    except RuntimeError as e:
+        if dev == "cuda" and batched and _is_cuda_oom(e):
+            die(
+                "CUDA out of memory during batched transcription. Re-run with a smaller --batch-size "
+                "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
+            )
+        raise
 
     ensure_parent_dir(out_txt)
     with open(out_txt, "w", encoding="utf-8") as f:
@@ -683,7 +714,7 @@ def whisper_transcribe_to_files(
         "language_probability": getattr(info, "language_probability", None),
         "duration": getattr(info, "duration", None),
         "batched": bool(batched),
-        "batch_size": 16 if batched else None,
+        "batch_size": int(batch_size) if batched else None,
         "vad_filter": bool(vad_filter),
         "clip_timestamps": clip_timestamps if isinstance(clip_timestamps, list) else None,
         "vad_keep": vad_keep if vad_keep is not None else None,
@@ -1474,6 +1505,8 @@ def main() -> None:
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--batched", action="store_true",
                     help="Use faster-whisper BatchedInferencePipeline (batch_size=16).")
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="In --batched mode, batch size for faster-whisper (default: 16). Lower it if you hit CUDA OOM.")
     ap.add_argument("--section-minutes", type=int, default=30,
                     help="Write <out_prefix>_sectioned.txt and <out_prefix>_timestamped.txt with this bin size (default: 30). Set 0 to disable.")
     ap.add_argument("--prevad", action="store_true",
@@ -1636,6 +1669,7 @@ def main() -> None:
             extra_payload=extra_payload,
             section_minutes=int(args.section_minutes),
             batched=bool(args.batched),
+            batch_size=int(args.batch_size),
         )
         return
 
