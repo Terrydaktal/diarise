@@ -50,18 +50,27 @@ def _parse_stat_time(s: str) -> datetime:
 
 def get_file_anchor_time(path: str) -> Tuple[datetime, str]:
     """
-    Returns (anchor_datetime, source) where source is "birth" or "mtime".
+    Returns (anchor_datetime, source) where source indicates which stat field was selected.
     """
     try:
-        birth = subprocess.check_output(["stat", "-c", "%w", path], text=True).strip()
+        fields = [
+            ("access", "%x"),
+            ("modify", "%y"),
+            ("change", "%z"),
+            ("birth", "%w"),
+        ]
+        parsed: List[Tuple[datetime, str]] = []
+        for name, fmt in fields:
+            s = subprocess.check_output(["stat", "-c", fmt, path], text=True).strip()
+            if s and s != "-":
+                parsed.append((_parse_stat_time(s), name))
     except Exception as e:
         raise RuntimeError(f"stat failed for {path}: {e}") from e
 
-    if birth and birth != "-":
-        return _parse_stat_time(birth), "birth"
-
-    mtime = subprocess.check_output(["stat", "-c", "%y", path], text=True).strip()
-    return _parse_stat_time(mtime), "mtime"
+    if not parsed:
+        raise RuntimeError(f"no usable stat times for {path}")
+    dt, src = min(parsed, key=lambda x: x[0])
+    return dt, f"earliest:{src}"
 
 
 @dataclass(frozen=True)
@@ -166,4 +175,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

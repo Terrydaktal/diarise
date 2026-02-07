@@ -120,3 +120,4 @@ Or render condensed audio from an existing VAD JSON:
 
 - `.hf_cache/` is used for HuggingFace downloads to avoid permission issues with `~/.cache`.
 - If CUDA is not usable on your machine, use `--whisper-device cpu`.
+- Sectioned transcript anchoring uses the earliest available file timestamp from `stat` (Access/Modify/Change/Birth).
