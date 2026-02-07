@@ -182,11 +182,211 @@ def write_sectioned_transcript(
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines).rstrip() + "\n")
 
+def merge_intervals(intervals: list[tuple[float, float]], gap: float) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: (x[0], x[1]))
+    out: list[tuple[float, float]] = []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_e + gap:
+            cur_e = max(cur_e, e)
+        else:
+            out.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    out.append((cur_s, cur_e))
+    return out
+
+def clamp_intervals(intervals: list[tuple[float, float]], lo: float, hi: float) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for s, e in intervals:
+        s2 = max(lo, s)
+        e2 = min(hi, e)
+        if e2 > s2:
+            out.append((s2, e2))
+    return out
+
+def drop_short(intervals: list[tuple[float, float]], min_len: float) -> list[tuple[float, float]]:
+    return [(s, e) for s, e in intervals if (e - s) >= min_len]
+
+def webrtc_vad_clip_timestamps(
+    *,
+    input_path: str,
+    dur_s: float,
+    sr: int = 16000,
+    frame_ms: int = 30,
+    aggressiveness: int = 2,
+    min_silence_ms: int = 300,
+    min_speech_s: float = 0.20,
+    pad_pre_s: float = 0.35,
+    pad_post_s: float = 0.60,
+    gap_cut_s: float = 10.0,
+    log_every_s: float = 300.0,
+) -> list[float]:
+    """
+    Returns clip_timestamps as a flat list: [start0, end0, start1, end1, ...]
+    for use with faster-whisper's `clip_timestamps`, in seconds in the ORIGINAL timeline.
+    """
+    try:
+        import webrtcvad
+    except ImportError:
+        die("Missing dependency: webrtcvad. Install with: pip install webrtcvad")
+
+    if frame_ms not in (10, 20, 30):
+        die("--prevad-frame-ms must be one of 10, 20, 30")
+    if not (0 <= aggressiveness <= 3):
+        die("--prevad-aggressiveness must be 0..3")
+
+    vad = webrtcvad.Vad(aggressiveness)
+    frame_s = frame_ms / 1000.0
+    samples_per_frame = int(sr * frame_s)
+    bytes_per_frame = samples_per_frame * 2  # s16le mono
+    min_silence_frames = max(1, int(round((min_silence_ms / 1000.0) / frame_s)))
+
+    # Stream decode to PCM. Don't pipe stderr without draining it.
+    # On corrupted/dirty inputs ffmpeg can spam stderr and block if we don't drain it.
+    ffmpeg_stderr_f = None
+    ff_cmd = [
+        "ffmpeg", "-v", "error",
+        "-i", input_path,
+        "-ac", "1", "-ar", str(sr),
+        "-f", "s16le", "-"
+    ]
+    try:
+        import tempfile
+
+        ffmpeg_stderr_f = tempfile.NamedTemporaryFile(prefix="webrtc_vad_ffmpeg_", suffix=".err", delete=False)
+        proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ffmpeg_stderr_f)
+    except Exception:
+        proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if proc.stdout is None:
+        die("Failed to start ffmpeg for WebRTC VAD PCM streaming")
+
+    segments: list[tuple[float, float]] = []
+    in_speech = False
+    speech_start = 0.0
+    silence_run = 0
+    processed_frames = 0
+    next_log_at = log_every_s if log_every_s > 0 else float("inf")
+
+    while True:
+        buf = proc.stdout.read(bytes_per_frame)
+        if not buf:
+            break
+        if len(buf) < bytes_per_frame:
+            buf = buf + b"\x00" * (bytes_per_frame - len(buf))
+
+        t_end = (processed_frames + 1) * frame_s
+        if t_end >= next_log_at:
+            total = dur_s if dur_s > 0 else t_end
+            print(f"[prevad] processed {t_end/3600:.2f}h / {total/3600:.2f}h", file=sys.stderr)
+            next_log_at += log_every_s
+
+        is_speech = vad.is_speech(buf, sr)
+        if is_speech:
+            if not in_speech:
+                in_speech = True
+                speech_start = processed_frames * frame_s
+            silence_run = 0
+        else:
+            if in_speech:
+                silence_run += 1
+                if silence_run >= min_silence_frames:
+                    end_t = (processed_frames + 1 - silence_run) * frame_s
+                    segments.append((speech_start, end_t))
+                    in_speech = False
+                    silence_run = 0
+
+        processed_frames += 1
+
+    total_dur = min(float(dur_s), processed_frames * frame_s) if dur_s else (processed_frames * frame_s)
+    if in_speech:
+        segments.append((speech_start, total_dur))
+
+    proc.stdout.close()
+    rc = proc.wait()
+    if ffmpeg_stderr_f is not None:
+        try:
+            ffmpeg_stderr_f.close()
+        except Exception:
+            pass
+    if rc != 0:
+        tail = ""
+        if ffmpeg_stderr_f is not None:
+            try:
+                with open(ffmpeg_stderr_f.name, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()[-20:]
+                tail = "".join(lines).strip()
+            except Exception:
+                tail = ""
+        if tail:
+            die(f"ffmpeg WebRTC PCM streaming failed (exit {rc}); stderr tail:\n{tail}")
+        die(f"ffmpeg WebRTC PCM streaming failed (exit {rc})")
+
+    # Postprocess: clamp, drop shorts, pad, merge across short pauses.
+    segments = clamp_intervals(segments, 0.0, total_dur)
+    segments = drop_short(segments, min_speech_s)
+
+    padded: list[tuple[float, float]] = []
+    for s, e in segments:
+        padded.append((s - pad_pre_s, e + pad_post_s))
+    padded = clamp_intervals(padded, 0.0, total_dur)
+    merged = merge_intervals(padded, gap=float(gap_cut_s))
+    merged = drop_short(merged, min_speech_s)
+
+    clip: list[float] = []
+    for s, e in merged:
+        clip.extend([float(s), float(e)])
+    return clip
+
 
 def ensure_parent_dir(path: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
+
+
+def _pairwise_clip_to_intervals(clip_timestamps: list[float]) -> list[list[float]]:
+    if len(clip_timestamps) % 2 != 0:
+        die("Internal error: clip_timestamps must have even length")
+    out: list[list[float]] = []
+    for i in range(0, len(clip_timestamps), 2):
+        s = float(clip_timestamps[i])
+        e = float(clip_timestamps[i + 1])
+        if e > s:
+            out.append([s, e])
+    return out
+
+
+def _prevad_write_report_json(report_path: str, *, input_path: str, vad_keep: list[list[float]], settings: dict[str, Any]) -> None:
+    ensure_parent_dir(report_path)
+    payload = {
+        "input": os.path.abspath(input_path),
+        "vad_keep": vad_keep,
+        "settings": settings,
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def _prevad_render_condensed_audio(
+    *,
+    diarise_path: str,
+    input_path: str,
+    report_json_path: str,
+    condensed_out: str,
+) -> None:
+    # Use the current interpreter so diarise sees the same venv deps.
+    cmd = [
+        sys.executable,
+        diarise_path,
+        input_path,
+        condensed_out,
+        "--condense-from-json",
+        report_json_path,
+    ]
+    subprocess.run(cmd, check=True)
 
 
 def main() -> None:
@@ -202,7 +402,28 @@ def main() -> None:
     ap.add_argument("--language", default=None, help="Language code, e.g. en. Default: auto-detect")
     ap.add_argument("--task", default="transcribe", choices=["transcribe", "translate"], help="Task (default: transcribe)")
     ap.add_argument("--beam-size", type=int, default=5, help="Beam size (default: 5)")
-    ap.add_argument("--vad-filter", action="store_true", help="Enable faster-whisper's internal VAD filter")
+    ap.set_defaults(vad_filter=True)
+    ap.add_argument("--vad-filter", dest="vad_filter", action="store_true",
+                    help="Enable faster-whisper's internal VAD filter (default: enabled)")
+    ap.add_argument("--no-vad-filter", dest="vad_filter", action="store_false",
+                    help="Disable faster-whisper's internal VAD filter")
+    ap.add_argument("--prevad", action="store_true",
+                    help="Run WebRTC VAD first and pass intervals to Whisper via clip_timestamps (disables built-in VAD).")
+    ap.add_argument("--prevad-gap-cut", type=float, default=10.0,
+                    help="In --prevad mode, merge speech across gaps <= this many seconds (default: 10)")
+    ap.add_argument("--prevad-pad-pre", type=float, default=0.35, help="In --prevad mode, pad before speech (default: 0.35s)")
+    ap.add_argument("--prevad-pad-post", type=float, default=0.60, help="In --prevad mode, pad after speech (default: 0.60s)")
+    ap.add_argument("--prevad-min-speech", type=float, default=0.20, help="In --prevad mode, drop speech segments shorter than this (default: 0.20s)")
+    ap.add_argument("--prevad-aggressiveness", type=int, default=2, help="In --prevad mode, WebRTC VAD aggressiveness 0..3 (default: 2)")
+    ap.add_argument("--prevad-frame-ms", type=int, default=30, choices=[10, 20, 30], help="In --prevad mode, WebRTC VAD frame size ms (default: 30)")
+    ap.add_argument("--prevad-min-silence-ms", type=int, default=300,
+                    help="In --prevad mode, close speech after this much non-speech (default: 300ms)")
+    ap.add_argument("--prevad-report-json", default=None,
+                    help="In --prevad mode, also write a VAD keep-interval JSON (default: <out_prefix>_prevad.json)")
+    ap.add_argument("--prevad-condensed-out", default=None,
+                    help="In --prevad mode, also render a condensed audio file using diarise (default: <out_prefix>_prevad_condensed.m4a)")
+    ap.add_argument("--prevad-no-preprocess", action="store_true",
+                    help="In --prevad mode, skip writing the VAD JSON / condensed audio (transcription still uses clip_timestamps).")
     ap.add_argument("--log-every", type=float, default=300.0, help="Progress log interval seconds (default: 300)")
     ap.add_argument("--section-minutes", type=int, default=30,
                     help="Also write a sectioned transcript (*_sectioned.txt) with this bin size (default: 30). Set 0 to disable.")
@@ -260,13 +481,74 @@ def main() -> None:
             die(f"Failed to initialize CUDA backend ({e}). Try: --device cpu")
         raise
 
+    clip_timestamps: list[float] | str = "0"
+    vad_filter = bool(args.vad_filter)
+    prevad_report_json_path: str | None = None
+    prevad_condensed_out_path: str | None = None
+    if args.prevad:
+        print("[prevad] running WebRTC VAD -> clip_timestamps", file=sys.stderr)
+        clip_timestamps = webrtc_vad_clip_timestamps(
+            input_path=in_path,
+            dur_s=total_s,
+            frame_ms=args.prevad_frame_ms,
+            aggressiveness=args.prevad_aggressiveness,
+            min_silence_ms=args.prevad_min_silence_ms,
+            min_speech_s=args.prevad_min_speech,
+            pad_pre_s=args.prevad_pad_pre,
+            pad_post_s=args.prevad_pad_post,
+            gap_cut_s=args.prevad_gap_cut,
+            log_every_s=max(0.0, float(args.log_every)),
+        )
+        vad_filter = False  # ignored when clip_timestamps is used, but keep explicit.
+        if not clip_timestamps:
+            die("Pre-VAD produced no keep intervals; nothing to transcribe.")
+
+        # Preprocess (only in --prevad): write intervals JSON and render condensed audio.
+        if not args.prevad_no_preprocess:
+            report_path = args.prevad_report_json or f"{out_prefix}_prevad.json"
+            prevad_report_json_path = report_path
+
+            condensed_out = args.prevad_condensed_out or f"{out_prefix}_prevad_condensed.m4a"
+            prevad_condensed_out_path = condensed_out
+
+            vad_keep = _pairwise_clip_to_intervals(clip_timestamps)
+            settings = {
+                "backend": "webrtc",
+                "sr": 16000,
+                "frame_ms": args.prevad_frame_ms,
+                "aggressiveness": args.prevad_aggressiveness,
+                "min_silence_ms": args.prevad_min_silence_ms,
+                "min_speech_s": args.prevad_min_speech,
+                "pad_pre_s": args.prevad_pad_pre,
+                "pad_post_s": args.prevad_pad_post,
+                "gap_cut_s": args.prevad_gap_cut,
+            }
+            _prevad_write_report_json(report_path, input_path=in_path, vad_keep=vad_keep, settings=settings)
+            print(f"[prevad] wrote report: {report_path}", file=sys.stderr)
+
+            diarise_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diarise")
+            if os.path.isfile(diarise_path):
+                try:
+                    print(f"[prevad] rendering condensed audio: {condensed_out}", file=sys.stderr)
+                    _prevad_render_condensed_audio(
+                        diarise_path=diarise_path,
+                        input_path=in_path,
+                        report_json_path=report_path,
+                        condensed_out=condensed_out,
+                    )
+                except Exception as e:
+                    print(f"[warn] prevad preprocessing failed to render condensed audio: {e}", file=sys.stderr)
+            else:
+                print("[warn] prevad preprocessing skipped: diarise script not found next to whisper_transcribe.py", file=sys.stderr)
+
     t0 = time.time()
     segments, info = model.transcribe(
         in_path,
         language=args.language,
         task=args.task,
         beam_size=args.beam_size,
-        vad_filter=args.vad_filter,
+        vad_filter=vad_filter,
+        clip_timestamps=clip_timestamps,
     )
 
     segs_out: List[Dict[str, Any]] = []
@@ -305,6 +587,12 @@ def main() -> None:
         "language": getattr(info, "language", None),
         "language_probability": getattr(info, "language_probability", None),
         "duration": getattr(info, "duration", None),
+        "prevad": bool(args.prevad),
+        "prevad_no_preprocess": bool(args.prevad_no_preprocess),
+        "prevad_report_json": os.path.abspath(prevad_report_json_path) if prevad_report_json_path else None,
+        "prevad_condensed_out": os.path.abspath(prevad_condensed_out_path) if prevad_condensed_out_path else None,
+        "vad_filter": bool(args.vad_filter) if not args.prevad else False,
+        "clip_timestamps": clip_timestamps if args.prevad else None,
         "segments": segs_out,
     }
     with open(out_json, "w", encoding="utf-8") as f:
