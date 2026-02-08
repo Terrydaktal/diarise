@@ -559,12 +559,18 @@ def whisper_transcribe_to_files(
         model = WhisperModel(model_name, device=dev, compute_type=compute_type)
     except Exception as e:
         if dev == "cuda":
-            print(f"[whisper] CUDA init failed ({e}); falling back to CPU", file=sys.stderr)
-            dev = "cpu"
-            compute_type = _whisper_cpu_compute_type(compute_type)
-            model = WhisperModel(model_name, device=dev, compute_type=compute_type)
-        else:
-            raise
+            die(
+                "CUDA init failed. Not falling back to CPU.\n"
+                f"Error: {e}\n"
+                "\n"
+                "Common fixes:\n"
+                "  - Ensure NVIDIA driver is installed and working (nvidia-smi should succeed).\n"
+                "  - Ensure cuBLAS is available. In this repo's venv you can install it with:\n"
+                "      ./.venv/bin/python -m pip install -U nvidia-cublas-cu12\n"
+                "    The ./diarise wrapper will automatically add nvidia/*/lib to LD_LIBRARY_PATH.\n"
+                "  - If you want CPU explicitly, re-run with: --whisper-device cpu\n"
+            )
+        raise
 
     # faster-whisper built-in Silero VAD defaults to threshold=0.5 and (in batched mode) min_silence_duration_ms=160.
     # We override these to be more sensitive and keep behavior consistent between batched and non-batched.
@@ -641,11 +647,20 @@ def whisper_transcribe_to_files(
                         "CUDA out of memory in --batched mode. Re-run with a smaller --batch-size "
                         "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
                     )
-                print(f"[whisper] CUDA runtime failed ({e}); falling back to CPU", file=sys.stderr)
-                dev = "cpu"
-                compute_type = _whisper_cpu_compute_type(compute_type)
-                model = WhisperModel(model_name, device=dev, compute_type=compute_type)
-                continue
+                die(
+                    "CUDA runtime failed during transcription. Not falling back to CPU.\n"
+                    f"Error: {e}\n"
+                    "\n"
+                    "If this mentions libcublas.so.12, install cuBLAS into the venv:\n"
+                    "  ./.venv/bin/python -m pip install -U nvidia-cublas-cu12\n"
+                    "\n"
+                    "If this is an out-of-memory error, lower one or more of:\n"
+                    "  - --batch-size (for --batched)\n"
+                    "  - --whisper-beam-size\n"
+                    "  - --whisper-model (e.g. base/small instead of medium)\n"
+                    "\n"
+                    "If you want CPU explicitly, re-run with: --whisper-device cpu\n"
+                )
 
             # BatchedInferencePipeline requires either vad_filter=True or clip_timestamps for long audio.
             # If the user disabled VAD in batched mode, retry using the non-batched pipeline.

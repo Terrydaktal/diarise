@@ -778,12 +778,13 @@ def main() -> None:
         model = WhisperModel(args.model, device=device, compute_type=compute_type)
     except Exception as e:
         if device == "cuda":
-            print(f"[warn] CUDA init failed ({e}); falling back to CPU", file=sys.stderr)
-            device = "cpu"
-            compute_type = _whisper_cpu_compute_type(compute_type)
-            model = WhisperModel(args.model, device=device, compute_type=compute_type)
-        else:
-            raise
+            die(
+                "CUDA init failed. Not falling back to CPU.\n"
+                f"Error: {e}\n"
+                "\n"
+                "If you want CPU explicitly, re-run with: --device cpu\n"
+            )
+        raise
 
     # Optional condensed->original timestamp mapping (for transcribing stitched outputs).
     timeline_map_path = args.timeline_map

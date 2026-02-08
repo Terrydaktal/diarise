@@ -19,6 +19,7 @@ Python packages (install into a venv):
 - `torch` + `torchaudio` (Silero VAD path)
 - `webrtcvad` (WebRTC VAD)
 - `faster-whisper` (Whisper via CTranslate2)
+- `nvidia-cublas-cu12` (recommended for CUDA; provides `libcublas.so.12`)
 
 ## Setup
 
@@ -26,8 +27,13 @@ Python packages (install into a venv):
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -U pip
-pip install numpy torch torchaudio webrtcvad faster-whisper
+pip install numpy torch torchaudio webrtcvad faster-whisper nvidia-cublas-cu12
 ```
+
+Notes:
+
+- `./diarise` is a small wrapper that runs `diarise.py` using `./.venv/bin/python` (or `./venv/bin/python`).
+- It also auto-adds `.../site-packages/nvidia/*/lib` to `LD_LIBRARY_PATH` so CTranslate2 can find CUDA libs like `libcublas.so.12`.
 
 ## Quick Start (Transcribe)
 
@@ -48,7 +54,7 @@ This writes:
 Defaults:
 
 - Whisper model: `--whisper-model base`
-- Whisper device: `--whisper-device cuda` (falls back to CPU if CUDA init/runtime fails)
+- Whisper device: `--whisper-device cuda` (does not fall back to CPU; pass `--whisper-device cpu` to force CPU)
 - Whisper language: `--whisper-language en`
 - Whisper compute type: `--whisper-compute-type float16` (CPU falls back to `int8`)
 - faster-whisper internal VAD filter: enabled
@@ -77,7 +83,7 @@ Disable sectioned output:
 Add `--prevad` to run:
 
 1. Dead-air prepass removal (stitch “keep” intervals into a temp file)
-2. WebRTC VAD on the prepassed audio
+2. WebRTC VAD on a streamed ffmpeg concat of kept intervals (no full re-encode)
 3. Map VAD intervals back to the original timeline
 4. Whisper on the original input using `clip_timestamps` (disables whisper VAD)
 
@@ -156,5 +162,6 @@ Or render condensed audio from an existing VAD JSON:
 
 - `.hf_cache/` is used for HuggingFace downloads to avoid permission issues with `~/.cache`.
 - If CUDA is not usable on your machine, use `--whisper-device cpu`.
-- Sectioned transcript anchoring uses the earliest available file timestamp from `stat` (Access/Modify/Change/Birth) on the original input audio file.
-- Anchor metadata is written into `*_whisper_*.json` as `anchor_file`, `anchor_time`, and `anchor_time_src`.
+- Timestamped/sectioned transcript anchoring uses the earliest available file timestamp from `stat` (Access/Modify/Change/Birth) on the original input audio file,
+  and treats it as the end-of-recording timestamp (computes start time as `anchor - duration`).
+- Anchor metadata is written into `*_whisper_*.json` as `anchor_file`, `anchor_time`, `anchor_time_src`, and `anchor_time_assumed=end_of_recording`.

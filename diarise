@@ -16,4 +16,29 @@ else
   exit 1
 fi
 
+# Some Python wheels (e.g. nvidia-cublas-cu12) ship CUDA shared libraries that
+# CTranslate2 loads dynamically (e.g. libcublas.so.12). Add them to the dynamic
+# loader path automatically so users don't have to export LD_LIBRARY_PATH.
+site_pkgs="$("${py}" -c 'import site; print(site.getsitepackages()[0])')"
+if [[ -d "${site_pkgs}/nvidia" ]]; then
+  # Typical layout: .../site-packages/nvidia/cublas/lib/libcublas.so.12
+  shopt -s nullglob
+  nvidia_lib_dirs=("${site_pkgs}"/nvidia/*/lib)
+  shopt -u nullglob
+  if (( ${#nvidia_lib_dirs[@]} > 0 )); then
+    joined=""
+    for d in "${nvidia_lib_dirs[@]}"; do
+      [[ -d "${d}" ]] || continue
+      if [[ -z "${joined}" ]]; then
+        joined="${d}"
+      else
+        joined="${joined}:${d}"
+      fi
+    done
+    if [[ -n "${joined}" ]]; then
+      export LD_LIBRARY_PATH="${joined}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
+  fi
+fi
+
 exec "${py}" "${here}/diarise.py" "$@"
