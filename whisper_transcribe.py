@@ -860,7 +860,7 @@ def main() -> None:
     if vad_filter and (not isinstance(clip_timestamps, list)):
         vad_parameters = {
             "threshold": 0.4,
-            "min_silence_duration_ms": 2000,
+            "min_silence_duration_ms": 10000,
         }
 
     t0 = time.time()

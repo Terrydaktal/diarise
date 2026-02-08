@@ -578,7 +578,7 @@ def whisper_transcribe_to_files(
     if vad_filter and (not isinstance(clip_timestamps, list)):
         vad_parameters = {
             "threshold": 0.4,
-            "min_silence_duration_ms": 2000,
+            "min_silence_duration_ms": 10000,
         }
 
     def _is_cuda_oom(e: BaseException) -> bool:
