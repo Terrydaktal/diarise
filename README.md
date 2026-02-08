@@ -86,7 +86,7 @@ If your recordings have lots of low-frequency rumble or high-frequency hiss, you
 ./diarise Recording.mp3 --bandpass
 ```
 
-This runs ffmpeg with a 2-pole highpass+lowpass (approximately 40 dB/decade rolloff), then transcribes the filtered audio.
+This runs ffmpeg with a 2-pole highpass+lowpass (approximately 40 dB/decade rolloff) from 100-7000 Hz, then transcribes the filtered audio.
 Anchoring and output filenames still refer to the original input.
 
 ## Faster Skip-Silence Transcribe (`--prevad`)

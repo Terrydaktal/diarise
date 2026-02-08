@@ -1574,7 +1574,7 @@ def main() -> None:
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--bandpass", action="store_true",
-                    help="Before Whisper, apply a 180-5000 Hz bandpass (2-pole highpass+lowpass ~= 40 dB/decade) via ffmpeg.")
+                    help="Before Whisper, apply a 100-7000 Hz bandpass (2-pole highpass+lowpass ~= 40 dB/decade) via ffmpeg.")
     ap.add_argument("--batched", action="store_true",
                     help="Use faster-whisper BatchedInferencePipeline (batch_size=16).")
     ap.add_argument("--batch-size", type=int, default=16,
@@ -1686,8 +1686,8 @@ def main() -> None:
                 bandpass_ctx = tempfile.TemporaryDirectory(prefix="transcribe_bandpass_")
                 bandpass_dir = bandpass_ctx.name  # type: ignore
 
-            bandpass_out = os.path.join(bandpass_dir, "bandpass_180_5000_16k_mono.flac")
-            print("[bandpass] rendering 180-5000 Hz bandpassed audio for Whisper", file=sys.stderr)
+            bandpass_out = os.path.join(bandpass_dir, "bandpass_100_7000_16k_mono.flac")
+            print("[bandpass] rendering 100-7000 Hz bandpassed audio for Whisper", file=sys.stderr)
             ff_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-nostats",
                 "-v", "error",
@@ -1698,7 +1698,7 @@ def main() -> None:
                 "-i", input_path,
                 "-vn",
                 # 2 poles ~= 12 dB/oct ~= 40 dB/decade rolloff
-                "-af", "highpass=f=180:poles=2,lowpass=f=5000:poles=2",
+                "-af", "highpass=f=100:poles=2,lowpass=f=7000:poles=2",
                 "-ar", "16000",
                 "-ac", "1",
                 "-c:a", "flac",
@@ -1709,7 +1709,7 @@ def main() -> None:
             extra_payload["bandpass"] = {
                 "enabled": True,
                 "source": "ffmpeg",
-                "af": "highpass=f=180:poles=2,lowpass=f=5000:poles=2",
+                "af": "highpass=f=100:poles=2,lowpass=f=7000:poles=2",
                 "out": os.path.abspath(bandpass_out),
                 "out_sr": 16000,
                 "out_ch": 1,
