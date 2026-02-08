@@ -438,6 +438,10 @@ def _resolve_whisper_model_name(name: str) -> str:
     raw = (name or "").strip()
     key = raw.lower().replace("_", "-")
     aliases = {
+        # "large" is ambiguous (v2 vs v3) in casual usage. Default to the best general model.
+        "large": "large-v3",
+        "largev3": "large-v3",
+        "whisper-large-v3": "large-v3",
         "large-turbo": "large-v3-turbo",
         "largev3-turbo": "large-v3-turbo",
         "whisper-large-v3-turbo": "large-v3-turbo",
@@ -1608,7 +1612,7 @@ def main() -> None:
     ap.add_argument(
         "--whisper-model",
         default="base",
-        help="Whisper model size/name (default: base). Supports alias: large-turbo -> large-v3-turbo",
+        help="Whisper model size/name (default: base). Supports aliases: large -> large-v3, large-turbo -> large-v3-turbo",
     )
     ap.add_argument("--whisper-device", default="cuda", choices=["auto", "cpu", "cuda"],
                     help="Device for Whisper inference (default: cuda)")

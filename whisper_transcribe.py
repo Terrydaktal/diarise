@@ -45,6 +45,9 @@ def _resolve_whisper_model_name(name: str) -> str:
     raw = (name or "").strip()
     key = raw.lower().replace("_", "-")
     aliases = {
+        "large": "large-v3",
+        "largev3": "large-v3",
+        "whisper-large-v3": "large-v3",
         "large-turbo": "large-v3-turbo",
         "largev3-turbo": "large-v3-turbo",
         "whisper-large-v3-turbo": "large-v3-turbo",
@@ -693,7 +696,11 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description="Transcribe audio using Whisper via faster-whisper.")
     ap.add_argument("input", help="Input audio/video file (any format ffmpeg can read)")
-    ap.add_argument("--model", default="base", help="Whisper model size/name (default: base). Supports alias: large-turbo -> large-v3-turbo")
+    ap.add_argument(
+        "--model",
+        default="base",
+        help="Whisper model size/name (default: base). Supports aliases: large -> large-v3, large-turbo -> large-v3-turbo",
+    )
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                     help="Device for inference (default: auto)")
     ap.add_argument("--compute-type", default="float16",
