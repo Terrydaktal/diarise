@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -429,6 +430,23 @@ def _whisper_cpu_compute_type(compute_type: str) -> str:
     if "float16" in ct or ct == "float16":
         return "int8"
     return compute_type
+
+def _resolve_whisper_model_name(name: str) -> str:
+    """
+    Map friendly aliases to faster-whisper model names.
+    """
+    raw = (name or "").strip()
+    key = raw.lower().replace("_", "-")
+    aliases = {
+        "large-turbo": "large-v3-turbo",
+        "largev3-turbo": "large-v3-turbo",
+        "whisper-large-v3-turbo": "large-v3-turbo",
+    }
+    return aliases.get(key, raw)
+
+def _safe_slug(s: str) -> str:
+    # Keep output filenames sane when model names include slashes (HF repo IDs) or spaces.
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "").strip()).strip("_") or "model"
 
 def _intervals_to_clip_timestamps(intervals: List[Interval]) -> List[float]:
     clip: List[float] = []
@@ -1558,7 +1576,11 @@ def main() -> None:
     # Whisper transcription (end-to-end in this script; default mode when OUTPUT is omitted)
     ap.add_argument("--out-prefix", default=None,
                     help="Output prefix for transcription files (default: <input_stem>_whisper_<model>).")
-    ap.add_argument("--whisper-model", default="base", help="Whisper model size/name (default: base)")
+    ap.add_argument(
+        "--whisper-model",
+        default="base",
+        help="Whisper model size/name (default: base). Supports alias: large-turbo -> large-v3-turbo",
+    )
     ap.add_argument("--whisper-device", default="cuda", choices=["auto", "cpu", "cuda"],
                     help="Device for Whisper inference (default: cuda)")
     ap.add_argument("--whisper-compute-type", default="float16",
@@ -1668,7 +1690,8 @@ def main() -> None:
     if (output_path is None) and (not args.timestamps_only) and (not args.condense_from_json):
 
         base = os.path.splitext(os.path.basename(input_path))[0]
-        out_prefix = args.out_prefix or f"{base}_whisper_{args.whisper_model}"
+        whisper_model = _resolve_whisper_model_name(args.whisper_model)
+        out_prefix = args.out_prefix or f"{base}_whisper_{_safe_slug(whisper_model)}"
 
         vad_keep: Optional[List[Interval]] = None
         clip_timestamps: List[float] | str = "0"
@@ -1770,7 +1793,7 @@ def main() -> None:
             out_prefix=out_prefix,
             anchor_file=input_path,
             reported_input=input_path,
-            model_name=args.whisper_model,
+            model_name=whisper_model,
             device=args.whisper_device,
             compute_type=args.whisper_compute_type,
             language=args.whisper_language,

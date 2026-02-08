@@ -41,6 +41,16 @@ def _whisper_cpu_compute_type(compute_type: str) -> str:
         return "int8"
     return compute_type
 
+def _resolve_whisper_model_name(name: str) -> str:
+    raw = (name or "").strip()
+    key = raw.lower().replace("_", "-")
+    aliases = {
+        "large-turbo": "large-v3-turbo",
+        "largev3-turbo": "large-v3-turbo",
+        "whisper-large-v3-turbo": "large-v3-turbo",
+    }
+    return aliases.get(key, raw)
+
 def ffprobe_duration_seconds(path: str) -> float:
     try:
         cp = subprocess.run(
@@ -683,7 +693,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description="Transcribe audio using Whisper via faster-whisper.")
     ap.add_argument("input", help="Input audio/video file (any format ffmpeg can read)")
-    ap.add_argument("--model", default="base", help="Whisper model size/name (default: base)")
+    ap.add_argument("--model", default="base", help="Whisper model size/name (default: base). Supports alias: large-turbo -> large-v3-turbo")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                     help="Device for inference (default: auto)")
     ap.add_argument("--compute-type", default="float16",
@@ -770,12 +780,13 @@ def main() -> None:
         if compute_type2 != compute_type:
             print(f"[info] cpu compute_type override: {compute_type} -> {compute_type2}", file=sys.stderr)
             compute_type = compute_type2
-    print(f"[info] model={args.model} device={device} compute_type={compute_type}", file=sys.stderr)
+    model_name = _resolve_whisper_model_name(args.model)
+    print(f"[info] model={model_name} device={device} compute_type={compute_type}", file=sys.stderr)
     if device == "cuda":
         print("[info] If this errors, your NVIDIA driver/userspace may be mismatched; re-run with --device cpu.", file=sys.stderr)
 
     try:
-        model = WhisperModel(args.model, device=device, compute_type=compute_type)
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
     except Exception as e:
         if device == "cuda":
             die(

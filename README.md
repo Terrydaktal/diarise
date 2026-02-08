@@ -66,6 +66,12 @@ Use a different model (e.g. `small`):
 ./diarise Recording.mp3 --whisper-model small
 ```
 
+Use Whisper large turbo (faster-whisper name is `large-v3-turbo`; `large-turbo` is an alias):
+
+```bash
+./diarise Recording.mp3 --whisper-model large-turbo
+```
+
 Force CPU:
 
 ```bash
