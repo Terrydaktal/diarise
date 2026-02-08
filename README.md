@@ -78,6 +78,17 @@ Disable sectioned output:
 ./diarise Recording.mp3 --section-minutes 0
 ```
 
+## Bandpass Before Whisper (`--bandpass`)
+
+If your recordings have lots of low-frequency rumble or high-frequency hiss, you can bandpass the audio before transcription:
+
+```bash
+./diarise Recording.mp3 --bandpass
+```
+
+This runs ffmpeg with a 2-pole highpass+lowpass (approximately 40 dB/decade rolloff), then transcribes the filtered audio.
+Anchoring and output filenames still refer to the original input.
+
 ## Faster Skip-Silence Transcribe (`--prevad`)
 
 Add `--prevad` to run:

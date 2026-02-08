@@ -515,6 +515,8 @@ def whisper_transcribe_to_files(
     *,
     input_path: str,
     out_prefix: str,
+    anchor_file: Optional[str] = None,
+    reported_input: Optional[str] = None,
     model_name: str,
     device: str,
     compute_type: str,
@@ -542,9 +544,15 @@ def whisper_transcribe_to_files(
     out_timestamped = f"{out_prefix}_timestamped.txt"
     out_sectioned = f"{out_prefix}_sectioned.txt"
 
+    if anchor_file is None:
+        anchor_file = input_path
+    if reported_input is None:
+        reported_input = input_path
+
     total_s = 0.0
     try:
-        total_s = ffprobe_duration_seconds(input_path)
+        # Prefer the "real" recording's duration for progress/anchoring even if Whisper runs on a temp file.
+        total_s = ffprobe_duration_seconds(anchor_file)
     except Exception:
         total_s = 0.0
 
@@ -756,12 +764,13 @@ def whisper_transcribe_to_files(
         f.write("\n".join(texts) + "\n")
 
     ensure_parent_dir(out_json)
-    anchor_dt, anchor_src = get_file_anchor_time(input_path)
-    anchor_tail_ok, anchor_tail_note = ffmpeg_tail_decodes_ok(input_path)
-    anchor_duration_s = ffprobe_duration_seconds(input_path)
+    anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
+    anchor_tail_ok, anchor_tail_note = ffmpeg_tail_decodes_ok(anchor_file)
+    anchor_duration_s = ffprobe_duration_seconds(anchor_file)
     payload: Dict[str, Any] = {
-        "input": os.path.abspath(input_path),
-        "anchor_file": os.path.abspath(input_path),
+        "input": os.path.abspath(reported_input),
+        "whisper_input": os.path.abspath(input_path),
+        "anchor_file": os.path.abspath(anchor_file),
         "anchor_time": anchor_dt.isoformat(timespec="seconds"),
         "anchor_time_src": anchor_src,
         "anchor_time_assumed": "end_of_recording",
@@ -791,14 +800,14 @@ def whisper_transcribe_to_files(
         try:
             write_sectioned_transcript(
                 out_path=out_sectioned,
-                anchor_file=input_path,
+                anchor_file=anchor_file,
                 segments=segs_out,
                 bin_minutes=section_minutes,
             )
             print(f"[whisper] wrote {out_sectioned}", file=sys.stderr)
             write_timestamped_transcript(
                 out_path=out_timestamped,
-                anchor_file=input_path,
+                anchor_file=anchor_file,
                 segments=segs_out,
                 bin_minutes=section_minutes,
             )
@@ -1564,6 +1573,8 @@ def main() -> None:
                     help="Disable faster-whisper internal VAD filter")
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
+    ap.add_argument("--bandpass", action="store_true",
+                    help="Before Whisper, apply a 180-5000 Hz bandpass (2-pole highpass+lowpass ~= 40 dB/decade) via ffmpeg.")
     ap.add_argument("--batched", action="store_true",
                     help="Use faster-whisper BatchedInferencePipeline (batch_size=16).")
     ap.add_argument("--batch-size", type=int, default=16,
@@ -1664,6 +1675,46 @@ def main() -> None:
         vad_filter = bool(args.whisper_vad_filter)
         extra_payload: Dict[str, Any] = {}
 
+        # Optional bandpass pre-processing for Whisper only (does not affect VAD passes).
+        whisper_input_path = input_path
+        bandpass_ctx = None
+        if args.bandpass:
+            if args.keep_temp:
+                bandpass_dir = tempfile.mkdtemp(prefix="transcribe_bandpass_keep_")
+                print(f"[info] keeping bandpass intermediates in: {bandpass_dir}", file=sys.stderr)
+            else:
+                bandpass_ctx = tempfile.TemporaryDirectory(prefix="transcribe_bandpass_")
+                bandpass_dir = bandpass_ctx.name  # type: ignore
+
+            bandpass_out = os.path.join(bandpass_dir, "bandpass_180_5000_16k_mono.flac")
+            print("[bandpass] rendering 180-5000 Hz bandpassed audio for Whisper", file=sys.stderr)
+            ff_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-nostats",
+                "-v", "error",
+                "-progress", "pipe:2",
+                # try to continue through minor container corruption where possible
+                "-fflags", "+discardcorrupt",
+                "-err_detect", "ignore_err",
+                "-i", input_path,
+                "-vn",
+                # 2 poles ~= 12 dB/oct ~= 40 dB/decade rolloff
+                "-af", "highpass=f=180:poles=2,lowpass=f=5000:poles=2",
+                "-ar", "16000",
+                "-ac", "1",
+                "-c:a", "flac",
+                bandpass_out,
+            ]
+            run_ffmpeg_with_progress(ff_cmd, label="bandpass", total_out_s=dur_s, emit_every_s=15.0)
+            whisper_input_path = bandpass_out
+            extra_payload["bandpass"] = {
+                "enabled": True,
+                "source": "ffmpeg",
+                "af": "highpass=f=180:poles=2,lowpass=f=5000:poles=2",
+                "out": os.path.abspath(bandpass_out),
+                "out_sr": 16000,
+                "out_ch": 1,
+            }
+
         if args.prevad:
             # Prepass dead-air removal (stitched) -> WebRTC VAD on prepassed audio -> map back to original timeline.
             if args.keep_temp:
@@ -1715,8 +1766,10 @@ def main() -> None:
             vad_filter = False
 
         whisper_transcribe_to_files(
-            input_path=input_path,
+            input_path=whisper_input_path,
             out_prefix=out_prefix,
+            anchor_file=input_path,
+            reported_input=input_path,
             model_name=args.whisper_model,
             device=args.whisper_device,
             compute_type=args.whisper_compute_type,
