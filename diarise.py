@@ -545,7 +545,12 @@ def whisper_transcribe_to_files(
     vad_filter: bool,
     vad_threshold: float = 0.5,
     vad_min_silence_ms: int = 1000,
+    vad_speech_pad_ms: int = 400,
     chunk_length_s: int = 30,
+    log_prob_threshold: Optional[float] = -1.0,
+    no_speech_threshold: Optional[float] = 0.6,
+    compression_ratio_threshold: Optional[float] = 2.4,
+    hallucination_silence_threshold: Optional[float] = None,
     clip_timestamps: List[float] | str,
     vad_keep: Optional[List[Interval]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
@@ -608,6 +613,7 @@ def whisper_transcribe_to_files(
         vad_parameters = {
             "threshold": float(vad_threshold),
             "min_silence_duration_ms": int(vad_min_silence_ms),
+            "speech_pad_ms": int(vad_speech_pad_ms),
         }
 
     max_chunk_len = int(chunk_length_s)
@@ -648,12 +654,16 @@ def whisper_transcribe_to_files(
                 language=language,
                 task=task,
                 beam_size=beam_size,
+                compression_ratio_threshold=compression_ratio_threshold,
+                log_prob_threshold=log_prob_threshold,
+                no_speech_threshold=no_speech_threshold,
                 vad_filter=vf,
                 vad_parameters=vad_parameters if vf else None,
                 clip_timestamps=clip_dicts,
                 without_timestamps=False,
                 batch_size=int(batch_size),
                 chunk_length=max_chunk_len,
+                hallucination_silence_threshold=hallucination_silence_threshold,
             )
 
         ct2: List[float] | str = clip_timestamps
@@ -667,10 +677,14 @@ def whisper_transcribe_to_files(
             language=language,
             task=task,
             beam_size=beam_size,
+            compression_ratio_threshold=compression_ratio_threshold,
+            log_prob_threshold=log_prob_threshold,
+            no_speech_threshold=no_speech_threshold,
             vad_filter=vad_filter,
             vad_parameters=vad_parameters if vad_filter else None,
             clip_timestamps=ct2,
             chunk_length=max_chunk_len,
+            hallucination_silence_threshold=hallucination_silence_threshold,
         )
 
     t0 = time.time()
@@ -1612,8 +1626,18 @@ def main() -> None:
                     help="faster-whisper (Silero) VAD threshold (higher => more strict) (default: 0.5)")
     ap.add_argument("--whisper-vad-min-silence-ms", type=int, default=1000,
                     help="Minimum silence duration to split speech segments in Whisper VAD (default: 1000ms)")
+    ap.add_argument("--whisper-vad-speech-pad-ms", type=int, default=400,
+                    help="Padding added around speech segments in Whisper VAD (default: 400ms). Increase to reduce boundary word drops.")
     ap.add_argument("--whisper-chunk-length", type=int, default=30,
                     help="Whisper decode chunk length in seconds (1..30) (default: 30)")
+    ap.add_argument("--whisper-log-prob-threshold", type=float, default=-1.0,
+                    help="Drop/avoid low-confidence segments below this avg log prob (default: -1.0). Higher (e.g. -0.7) is stricter.")
+    ap.add_argument("--whisper-no-speech-threshold", type=float, default=0.6,
+                    help="No-speech probability threshold (default: 0.6). Lower is more aggressive at skipping non-speech.")
+    ap.add_argument("--whisper-compression-ratio-threshold", type=float, default=2.4,
+                    help="Compression ratio threshold for decoding fallback/hallucination handling (default: 2.4). Lower is stricter.")
+    ap.add_argument("--whisper-hallucination-silence-threshold", type=float, default=None,
+                    help="If set, treat long silence as a boundary to reduce hallucinations (seconds). Default: unset.")
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--bandpass", action="store_true",
@@ -1824,7 +1848,14 @@ def main() -> None:
             vad_filter=vad_filter,
             vad_threshold=float(args.whisper_vad_threshold),
             vad_min_silence_ms=int(args.whisper_vad_min_silence_ms),
+            vad_speech_pad_ms=int(args.whisper_vad_speech_pad_ms),
             chunk_length_s=int(args.whisper_chunk_length),
+            log_prob_threshold=float(args.whisper_log_prob_threshold),
+            no_speech_threshold=float(args.whisper_no_speech_threshold),
+            compression_ratio_threshold=float(args.whisper_compression_ratio_threshold),
+            hallucination_silence_threshold=(
+                None if args.whisper_hallucination_silence_threshold is None else float(args.whisper_hallucination_silence_threshold)
+            ),
             clip_timestamps=clip_timestamps,
             vad_keep=vad_keep,
             extra_payload=extra_payload,

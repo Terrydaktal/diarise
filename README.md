@@ -60,6 +60,7 @@ Defaults:
 - faster-whisper internal VAD filter: enabled
 - Whisper VAD threshold: `--whisper-vad-threshold 0.5`
 - Whisper VAD min silence: `--whisper-vad-min-silence-ms 1000`
+- Whisper VAD speech pad: `--whisper-vad-speech-pad-ms 400`
 - Whisper chunk length: `--whisper-chunk-length 30`
 - Sectioned transcript bins: `--section-minutes 30` (set `0` to disable)
 
