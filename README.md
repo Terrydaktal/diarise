@@ -58,6 +58,8 @@ Defaults:
 - Whisper language: `--whisper-language en`
 - Whisper compute type: `--whisper-compute-type float16` (CPU falls back to `int8`)
 - faster-whisper internal VAD filter: enabled
+- Whisper VAD threshold: `--whisper-vad-threshold 0.5`
+- Whisper VAD min silence: `--whisper-vad-min-silence-ms 1000`
 - Sectioned transcript bins: `--section-minutes 30` (set `0` to disable)
 
 Use a different model (e.g. `small`):

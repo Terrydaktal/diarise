@@ -543,6 +543,8 @@ def whisper_transcribe_to_files(
     beam_size: int,
     log_every_s: float,
     vad_filter: bool,
+    vad_threshold: float = 0.5,
+    vad_min_silence_ms: int = 1000,
     clip_timestamps: List[float] | str,
     vad_keep: Optional[List[Interval]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
@@ -599,12 +601,12 @@ def whisper_transcribe_to_files(
         raise
 
     # faster-whisper built-in Silero VAD defaults to threshold=0.5 and (in batched mode) min_silence_duration_ms=160.
-    # We override these to be more sensitive and keep behavior consistent between batched and non-batched.
+    # We default to threshold=0.5 and min_silence_duration_ms=1000, configurable via CLI flags.
     vad_parameters = None
     if vad_filter and (not isinstance(clip_timestamps, list)):
         vad_parameters = {
-            "threshold": 0.4,
-            "min_silence_duration_ms": 10000,
+            "threshold": float(vad_threshold),
+            "min_silence_duration_ms": int(vad_min_silence_ms),
         }
 
     def _is_cuda_oom(e: BaseException) -> bool:
@@ -1593,6 +1595,10 @@ def main() -> None:
                     help="Enable faster-whisper internal VAD filter (default: enabled)")
     ap.add_argument("--no-whisper-vad-filter", dest="whisper_vad_filter", action="store_false",
                     help="Disable faster-whisper internal VAD filter")
+    ap.add_argument("--whisper-vad-threshold", type=float, default=0.5,
+                    help="faster-whisper (Silero) VAD threshold (higher => more strict) (default: 0.5)")
+    ap.add_argument("--whisper-vad-min-silence-ms", type=int, default=1000,
+                    help="Minimum silence duration to split speech segments in Whisper VAD (default: 1000ms)")
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--bandpass", action="store_true",
@@ -1801,6 +1807,8 @@ def main() -> None:
             beam_size=args.whisper_beam_size,
             log_every_s=float(args.whisper_log_every),
             vad_filter=vad_filter,
+            vad_threshold=float(args.whisper_vad_threshold),
+            vad_min_silence_ms=int(args.whisper_vad_min_silence_ms),
             clip_timestamps=clip_timestamps,
             vad_keep=vad_keep,
             extra_payload=extra_payload,
