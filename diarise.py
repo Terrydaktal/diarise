@@ -545,6 +545,7 @@ def whisper_transcribe_to_files(
     vad_filter: bool,
     vad_threshold: float = 0.5,
     vad_min_silence_ms: int = 1000,
+    chunk_length_s: int = 30,
     clip_timestamps: List[float] | str,
     vad_keep: Optional[List[Interval]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
@@ -609,6 +610,10 @@ def whisper_transcribe_to_files(
             "min_silence_duration_ms": int(vad_min_silence_ms),
         }
 
+    max_chunk_len = int(chunk_length_s)
+    if max_chunk_len <= 0 or max_chunk_len > 30:
+        die("--whisper-chunk-length must be between 1 and 30 seconds")
+
     def _is_cuda_oom(e: BaseException) -> bool:
         s = str(e).lower()
         return ("out of memory" in s) or ("cublas_status_alloc_failed" in s)
@@ -634,8 +639,8 @@ def whisper_transcribe_to_files(
             if isinstance(clip_timestamps, list):
                 # Batched pipeline expects clip_timestamps as [{"start":s,"end":e}, ...] in seconds.
                 ivs = [(float(clip_timestamps[i]), float(clip_timestamps[i + 1])) for i in range(0, len(clip_timestamps), 2)]
-                # Batched pipeline will truncate segments > chunk_length (default 30s). Split to be safe.
-                ivs = _split_intervals_max_len(ivs, 30.0)
+                # Batched pipeline will truncate segments > chunk_length. Split to be safe.
+                ivs = _split_intervals_max_len(ivs, float(max_chunk_len))
                 clip_dicts = _clip_timestamps_dicts(ivs)
                 vf = False  # ignored when clip_timestamps is set, but keep explicit.
             return pipe.transcribe(
@@ -648,7 +653,14 @@ def whisper_transcribe_to_files(
                 clip_timestamps=clip_dicts,
                 without_timestamps=False,
                 batch_size=int(batch_size),
+                chunk_length=max_chunk_len,
             )
+
+        ct2: List[float] | str = clip_timestamps
+        if isinstance(clip_timestamps, list):
+            ivs = [(float(clip_timestamps[i]), float(clip_timestamps[i + 1])) for i in range(0, len(clip_timestamps), 2)]
+            ivs = _split_intervals_max_len(ivs, float(max_chunk_len))
+            ct2 = _intervals_to_clip_timestamps(ivs)
 
         return model.transcribe(
             input_path,
@@ -657,7 +669,8 @@ def whisper_transcribe_to_files(
             beam_size=beam_size,
             vad_filter=vad_filter,
             vad_parameters=vad_parameters if vad_filter else None,
-            clip_timestamps=clip_timestamps,
+            clip_timestamps=ct2,
+            chunk_length=max_chunk_len,
         )
 
     t0 = time.time()
@@ -1599,6 +1612,8 @@ def main() -> None:
                     help="faster-whisper (Silero) VAD threshold (higher => more strict) (default: 0.5)")
     ap.add_argument("--whisper-vad-min-silence-ms", type=int, default=1000,
                     help="Minimum silence duration to split speech segments in Whisper VAD (default: 1000ms)")
+    ap.add_argument("--whisper-chunk-length", type=int, default=30,
+                    help="Whisper decode chunk length in seconds (1..30) (default: 30)")
     ap.add_argument("--whisper-log-every", type=float, default=300.0,
                     help="Whisper progress log interval seconds (default: 300). Set 0 to disable.")
     ap.add_argument("--bandpass", action="store_true",
@@ -1809,6 +1824,7 @@ def main() -> None:
             vad_filter=vad_filter,
             vad_threshold=float(args.whisper_vad_threshold),
             vad_min_silence_ms=int(args.whisper_vad_min_silence_ms),
+            chunk_length_s=int(args.whisper_chunk_length),
             clip_timestamps=clip_timestamps,
             vad_keep=vad_keep,
             extra_payload=extra_payload,
