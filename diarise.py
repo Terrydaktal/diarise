@@ -575,6 +575,21 @@ def whisper_transcribe_to_files(
             "min_silence_duration_ms": 2000,
         }
 
+    def _is_cuda_oom(e: BaseException) -> bool:
+        s = str(e).lower()
+        return ("out of memory" in s) or ("cublas_status_alloc_failed" in s)
+
+    def _is_cuda_runtime_issue(e: BaseException) -> bool:
+        # Covers common late-fail cases where CUDA loads lazily (e.g. missing libcublas at first GEMM).
+        s = str(e).lower()
+        return (
+            ("libcublas.so" in s)
+            or ("cublas" in s)
+            or ("cudart" in s)
+            or ("cuda failed" in s)
+            or ("cuda runtime" in s)
+        )
+
     def do_transcribe() -> Tuple[Iterable[Any], Any]:
         if batched:
             from faster_whisper.transcribe import BatchedInferencePipeline
@@ -611,27 +626,27 @@ def whisper_transcribe_to_files(
             clip_timestamps=clip_timestamps,
         )
 
-    def _is_cuda_oom(e: BaseException) -> bool:
-        s = str(e).lower()
-        return ("out of memory" in s) or ("cublas_status_alloc_failed" in s)
-
     t0 = time.time()
-    try:
-        segments, info = do_transcribe()
-    except RuntimeError as e:
-        # Some CUDA setups can initialize but fail when the first GEMM runs (e.g. cuBLAS errors).
-        if dev == "cuda":
-            if batched and _is_cuda_oom(e):
-                die(
-                    "CUDA out of memory in --batched mode. Re-run with a smaller --batch-size "
-                    "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
-                )
-            print(f"[whisper] CUDA runtime failed ({e}); falling back to CPU", file=sys.stderr)
-            dev = "cpu"
-            compute_type = _whisper_cpu_compute_type(compute_type)
-            model = WhisperModel(model_name, device=dev, compute_type=compute_type)
+    segments = None
+    info = None
+    while True:
+        try:
             segments, info = do_transcribe()
-        else:
+            break
+        except RuntimeError as e:
+            # Some CUDA setups can initialize but fail when the first GEMM runs (e.g. cuBLAS errors).
+            if dev == "cuda":
+                if batched and _is_cuda_oom(e):
+                    die(
+                        "CUDA out of memory in --batched mode. Re-run with a smaller --batch-size "
+                        "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
+                    )
+                print(f"[whisper] CUDA runtime failed ({e}); falling back to CPU", file=sys.stderr)
+                dev = "cpu"
+                compute_type = _whisper_cpu_compute_type(compute_type)
+                model = WhisperModel(model_name, device=dev, compute_type=compute_type)
+                continue
+
             # BatchedInferencePipeline requires either vad_filter=True or clip_timestamps for long audio.
             # If the user disabled VAD in batched mode, retry using the non-batched pipeline.
             if batched and "No clip timestamps found" in str(e):
@@ -645,29 +660,30 @@ def whisper_transcribe_to_files(
                     vad_parameters=vad_parameters if vad_filter else None,
                     clip_timestamps=clip_timestamps,
                 )
-            else:
-                raise
-    except AssertionError as e:
-        # BatchedInferencePipeline can assert on some corrupt inputs (e.g. container duration > decodable audio).
-        # Fall back to the non-batched pipeline so the run still completes.
-        if batched:
-            print(f"[whisper] batched pipeline failed ({e}); retrying non-batched", file=sys.stderr)
-            segments, info = model.transcribe(
-                input_path,
-                language=language,
-                task=task,
-                beam_size=beam_size,
-                vad_filter=vad_filter,
-                vad_parameters=vad_parameters if vad_filter else None,
-                clip_timestamps=clip_timestamps,
-            )
-        else:
+                break
+            raise
+        except AssertionError as e:
+            # BatchedInferencePipeline can assert on some corrupt inputs (e.g. container duration > decodable audio).
+            # Fall back to the non-batched pipeline so the run still completes.
+            if batched:
+                print(f"[whisper] batched pipeline failed ({e}); retrying non-batched", file=sys.stderr)
+                segments, info = model.transcribe(
+                    input_path,
+                    language=language,
+                    task=task,
+                    beam_size=beam_size,
+                    vad_filter=vad_filter,
+                    vad_parameters=vad_parameters if vad_filter else None,
+                    clip_timestamps=clip_timestamps,
+                )
+                break
             raise
 
     segs_out: List[Dict[str, Any]] = []
     texts: List[str] = []
     next_log_at = log_every_s if log_every_s > 0 else float("inf")
     try:
+        assert segments is not None
         for s in segments:
             end_t = float(s.end)
             if end_t >= next_log_at:
@@ -683,12 +699,42 @@ def whisper_transcribe_to_files(
             if txt:
                 texts.append(txt)
     except RuntimeError as e:
-        if dev == "cuda" and batched and _is_cuda_oom(e):
-            die(
-                "CUDA out of memory during batched transcription. Re-run with a smaller --batch-size "
-                "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
-            )
-        raise
+        # BatchedInferencePipeline can fail lazily while iterating the generator. If CUDA dies mid-run,
+        # retry from scratch on CPU rather than dumping a stack trace.
+        if dev == "cuda":
+            if batched and _is_cuda_oom(e):
+                die(
+                    "CUDA out of memory during batched transcription. Re-run with a smaller --batch-size "
+                    "(e.g. 8 for medium) and/or smaller --whisper-beam-size."
+                )
+            if _is_cuda_runtime_issue(e):
+                print(f"[whisper] CUDA runtime failed while iterating segments ({e}); retrying on CPU", file=sys.stderr)
+                dev = "cpu"
+                compute_type = _whisper_cpu_compute_type(compute_type)
+                model = WhisperModel(model_name, device=dev, compute_type=compute_type)
+                # Restart from scratch.
+                segs_out = []
+                texts = []
+                next_log_at = log_every_s if log_every_s > 0 else float('inf')
+                segments, info = do_transcribe()
+                for s in segments:
+                    end_t = float(s.end)
+                    if end_t >= next_log_at:
+                        if total_s > 0:
+                            pct = max(0.0, min(100.0, (end_t / total_s) * 100.0))
+                            print(f"[whisper] {end_t/3600:.2f}h / {total_s/3600:.2f}h ({pct:.1f}%)", file=sys.stderr, flush=True)
+                        else:
+                            print(f"[whisper] {end_t/3600:.2f}h", file=sys.stderr, flush=True)
+                        next_log_at += log_every_s
+                    segs_out.append({"start": float(s.start), "end": float(s.end), "text": s.text})
+                    txt = (s.text or "").strip()
+                    if txt:
+                        texts.append(txt)
+                # Continue writing outputs.
+            else:
+                raise
+        else:
+            raise
 
     ensure_parent_dir(out_txt)
     with open(out_txt, "w", encoding="utf-8") as f:
