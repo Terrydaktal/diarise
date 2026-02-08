@@ -546,6 +546,7 @@ def whisper_transcribe_to_files(
     task: str,
     beam_size: int,
     initial_prompt: Optional[str] = None,
+    hotwords: Optional[str] = None,
     log_every_s: float,
     vad_filter: bool,
     vad_threshold: float = 0.5,
@@ -585,6 +586,12 @@ def whisper_transcribe_to_files(
         initial_prompt2 = (initial_prompt or "").strip()
         if initial_prompt2 == "":
             initial_prompt2 = None
+
+    hotwords2 = None
+    if hotwords is not None:
+        hotwords2 = (hotwords or "").strip()
+        if hotwords2 == "":
+            hotwords2 = None
 
     total_s = 0.0
     try:
@@ -666,6 +673,7 @@ def whisper_transcribe_to_files(
                 task=task,
                 beam_size=beam_size,
                 initial_prompt=initial_prompt2,
+                hotwords=hotwords2,
                 compression_ratio_threshold=compression_ratio_threshold,
                 log_prob_threshold=log_prob_threshold,
                 no_speech_threshold=no_speech_threshold,
@@ -690,6 +698,7 @@ def whisper_transcribe_to_files(
             task=task,
             beam_size=beam_size,
             initial_prompt=initial_prompt2,
+            hotwords=hotwords2,
             compression_ratio_threshold=compression_ratio_threshold,
             log_prob_threshold=log_prob_threshold,
             no_speech_threshold=no_speech_threshold,
@@ -740,6 +749,7 @@ def whisper_transcribe_to_files(
                     task=task,
                     beam_size=beam_size,
                     initial_prompt=initial_prompt2,
+                    hotwords=hotwords2,
                     vad_filter=vad_filter,
                     vad_parameters=vad_parameters if vad_filter else None,
                     clip_timestamps=clip_timestamps,
@@ -757,6 +767,7 @@ def whisper_transcribe_to_files(
                     task=task,
                     beam_size=beam_size,
                     initial_prompt=initial_prompt2,
+                    hotwords=hotwords2,
                     vad_filter=vad_filter,
                     vad_parameters=vad_parameters if vad_filter else None,
                     clip_timestamps=clip_timestamps,
@@ -841,6 +852,7 @@ def whisper_transcribe_to_files(
         "anchor_duration_s": float(anchor_duration_s),
         "model": model_name,
         "initial_prompt": initial_prompt2,
+        "hotwords": hotwords2,
         "device": dev,
         "compute_type": compute_type,
         "language": getattr(info, "language", None),
@@ -1635,6 +1647,8 @@ def main() -> None:
     ap.add_argument("--whisper-beam-size", type=int, default=5, help="Beam size (default: 5)")
     ap.add_argument("--whisper-initial-prompt", default="Hello.",
                     help="Initial prompt to seed Whisper context. Default: 'Hello.'. Use empty string to disable.")
+    ap.add_argument("--whisper-hotwords", default="",
+                    help="Hotwords to bias decoding across the whole file (e.g. 'jerboa jerboas gerbil'). Default: disabled.")
     ap.set_defaults(whisper_vad_filter=True)
     ap.add_argument("--whisper-vad-filter", dest="whisper_vad_filter", action="store_true",
                     help="Enable faster-whisper internal VAD filter (default: enabled)")
@@ -1863,6 +1877,7 @@ def main() -> None:
             task=args.whisper_task,
             beam_size=args.whisper_beam_size,
             initial_prompt=args.whisper_initial_prompt,
+            hotwords=args.whisper_hotwords,
             log_every_s=float(args.whisper_log_every),
             vad_filter=vad_filter,
             vad_threshold=float(args.whisper_vad_threshold),
