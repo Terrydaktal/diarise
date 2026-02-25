@@ -242,7 +242,13 @@ def get_file_anchor_time(path: str) -> Tuple[datetime, str]:
     dt, src = min(parsed, key=lambda x: x[0])
     return dt, f"earliest:{src}"
 
-def ffmpeg_tail_decodes_ok(path: str, *, seconds_from_end: float = 60.0, probe_len_s: float = 10.0) -> Tuple[bool, str]:
+def ffmpeg_tail_decodes_ok(
+    path: str,
+    *,
+    seconds_from_end: float = 60.0,
+    probe_len_s: float = 10.0,
+    timeout_s: float = 45.0,
+) -> Tuple[bool, str]:
     """
     Quick corruption check: try decoding a short slice near the end of the file.
     Returns (ok, note). "ok" means we could decode without ffmpeg error output/exit.
@@ -253,6 +259,7 @@ def ffmpeg_tail_decodes_ok(path: str, *, seconds_from_end: float = 60.0, probe_l
     # Use -sseof to seek from end. This is fast and doesn't require scanning the whole file.
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-v",
         "error",
@@ -267,7 +274,11 @@ def ffmpeg_tail_decodes_ok(path: str, *, seconds_from_end: float = 60.0, probe_l
         "null",
         "-",
     ]
-    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    timeout_s = max(float(timeout_s), float(probe_len_s) + 1.0)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, f"tail decode probe timed out after {timeout_s:.1f}s"
     err = (p.stderr or "").strip()
     if p.returncode != 0 or err:
         return False, "tail decode had ffmpeg errors (file may be truncated/corrupt)"
@@ -279,6 +290,7 @@ def write_sectioned_transcript(
     anchor_file: str,
     segments: List[Dict[str, Any]],
     bin_minutes: int,
+    tail_probe: Optional[Tuple[bool, str]] = None,
 ) -> None:
     if bin_minutes <= 0:
         return
@@ -287,7 +299,10 @@ def write_sectioned_transcript(
     # Interpret anchor_dt as the end of the recording, and back-calculate the start using ffprobe duration.
     dur_s = ffprobe_duration_seconds(anchor_file)
     start_dt = anchor_dt - timedelta(seconds=float(dur_s))
-    tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
+    if tail_probe is None:
+        tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
+    else:
+        tail_ok, tail_note = tail_probe
     bin_s = float(bin_minutes) * 60.0
 
     # Group by bin index using segment start.
@@ -345,6 +360,7 @@ def write_timestamped_transcript(
     anchor_file: str,
     segments: List[Dict[str, Any]],
     bin_minutes: int,
+    tail_probe: Optional[Tuple[bool, str]] = None,
 ) -> None:
     """
     Like write_sectioned_transcript, but each segment line includes absolute timestamps.
@@ -355,7 +371,10 @@ def write_timestamped_transcript(
     anchor_dt, anchor_src = get_file_anchor_time(anchor_file)
     dur_s = ffprobe_duration_seconds(anchor_file)
     start_dt = anchor_dt - timedelta(seconds=float(dur_s))
-    tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
+    if tail_probe is None:
+        tail_ok, tail_note = ffmpeg_tail_decodes_ok(anchor_file)
+    else:
+        tail_ok, tail_note = tail_probe
     bin_s = float(bin_minutes) * 60.0
 
     bins: Dict[int, List[Dict[str, Any]]] = {}
@@ -451,6 +470,78 @@ def _resolve_whisper_model_name(name: str) -> str:
 def _safe_slug(s: str) -> str:
     # Keep output filenames sane when model names include slashes (HF repo IDs) or spaces.
     return re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "").strip()).strip("_") or "model"
+
+SUPPORTED_BATCH_AUDIO_EXTS = {
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".wma",
+    ".aiff",
+    ".aif",
+    ".mka",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".m4v",
+}
+
+
+def _list_audio_files_in_dir(input_dir: str) -> List[str]:
+    out: List[str] = []
+    try:
+        with os.scandir(input_dir) as it:
+            for ent in it:
+                if not ent.is_file():
+                    continue
+                ext = os.path.splitext(ent.name)[1].lower()
+                if ext in SUPPORTED_BATCH_AUDIO_EXTS:
+                    out.append(ent.path)
+    except OSError as e:
+        die(f"Failed to scan input directory: {e}")
+    out.sort(key=lambda p: os.path.basename(p).lower())
+    return out
+
+
+def _transcription_outputs_complete(out_prefix: str, section_minutes: int) -> bool:
+    required = [
+        f"{out_prefix}.txt",
+        f"{out_prefix}.json",
+    ]
+    if section_minutes > 0:
+        required.extend(
+            [
+                f"{out_prefix}_sectioned.txt",
+                f"{out_prefix}_timestamped.txt",
+            ]
+        )
+    for p in required:
+        if not os.path.isfile(p):
+            return False
+        try:
+            if os.path.getsize(p) <= 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _batch_out_prefix_for_source(source_path: str, out_dir: str, model_slug: str) -> str:
+    """
+    Stable per-file prefix for directory mode.
+    Includes the source extension token to avoid stem collisions (e.g. clip.wav vs clip.mp3).
+    """
+    filename = os.path.basename(source_path)
+    stem, ext = os.path.splitext(filename)
+    ext_token = (ext[1:] if ext.startswith(".") else ext).lower()
+    if ext_token:
+        stem = f"{stem}_{ext_token}"
+    return os.path.join(out_dir, f"{stem}_whisper_{model_slug}")
 
 def _intervals_to_clip_timestamps(intervals: List[Interval]) -> List[float]:
     clip: List[float] = []
@@ -878,6 +969,7 @@ def whisper_transcribe_to_files(
                 anchor_file=anchor_file,
                 segments=segs_out,
                 bin_minutes=section_minutes,
+                tail_probe=(anchor_tail_ok, anchor_tail_note),
             )
             print(f"[whisper] wrote {out_sectioned}", file=sys.stderr)
             write_timestamped_transcript(
@@ -885,6 +977,7 @@ def whisper_transcribe_to_files(
                 anchor_file=anchor_file,
                 segments=segs_out,
                 bin_minutes=section_minutes,
+                tail_probe=(anchor_tail_ok, anchor_tail_note),
             )
             print(f"[whisper] wrote {out_timestamped}", file=sys.stderr)
         except Exception as e:
@@ -1592,9 +1685,11 @@ def main() -> None:
     which_or_die("ffprobe")
 
     ap = argparse.ArgumentParser(description="Condense a long recording or output speech timestamps (VAD).")
-    ap.add_argument("input", help="Input audio/video file (any format ffmpeg can read)")
+    ap.add_argument("input", help="Input audio/video file, or a directory of files in transcription mode")
     ap.add_argument("output", nargs="?", default=None,
-                    help="Final condensed output file (codec inferred from extension). Optional with --timestamps-only.")
+                    help="Final condensed output file (codec inferred from extension). "
+                         "If INPUT is a directory in transcription mode, this is the output directory. "
+                         "Optional with --timestamps-only.")
 
     # Prepass knobs
     ap.add_argument("--gap-cut", type=float, default=10.0,
@@ -1690,8 +1785,13 @@ def main() -> None:
     input_path = args.input
     output_path = args.output
 
-    if not os.path.isfile(input_path):
-        die(f"Input file not found: {input_path}")
+    input_is_file = os.path.isfile(input_path)
+    input_is_dir = os.path.isdir(input_path)
+    if not input_is_file and not input_is_dir:
+        die(f"Input path not found: {input_path}")
+
+    if args.postprocess_json and input_is_dir:
+        die("--postprocess-json requires INPUT to be a single audio file (used as anchor).")
 
     if args.postprocess_json:
         if int(args.section_minutes) <= 0:
@@ -1708,13 +1808,23 @@ def main() -> None:
         out_prefix = os.path.splitext(os.path.abspath(args.postprocess_json))[0]
         out_sectioned = f"{out_prefix}_sectioned.txt"
         out_timestamped = f"{out_prefix}_timestamped.txt"
-        write_sectioned_transcript(out_path=out_sectioned, anchor_file=input_path, segments=segs, bin_minutes=int(args.section_minutes))
-        write_timestamped_transcript(out_path=out_timestamped, anchor_file=input_path, segments=segs, bin_minutes=int(args.section_minutes))
+        tail_probe = ffmpeg_tail_decodes_ok(input_path)
+        write_sectioned_transcript(
+            out_path=out_sectioned,
+            anchor_file=input_path,
+            segments=segs,
+            bin_minutes=int(args.section_minutes),
+            tail_probe=tail_probe,
+        )
+        write_timestamped_transcript(
+            out_path=out_timestamped,
+            anchor_file=input_path,
+            segments=segs,
+            bin_minutes=int(args.section_minutes),
+            tail_probe=tail_probe,
+        )
         print(f"[done] wrote {out_sectioned} and {out_timestamped}", file=sys.stderr)
         return
-
-    dur_s = ffprobe_duration_seconds(input_path)
-    print(f"[info] input duration: {dur_s/3600:.2f} hours", file=sys.stderr)
 
     pre_cfg = PrepassConfig(
         sr=16000,
@@ -1744,31 +1854,13 @@ def main() -> None:
         min_silence_ms=args.webrtc_min_silence_ms,
     )
 
-    report = {
-        "input": os.path.abspath(input_path),
-        "output": os.path.abspath(output_path) if output_path else None,
-        "input_duration_s": dur_s,
-        "settings": {
-            "gap_cut_s": args.gap_cut,
-            "prepass": pre_cfg.__dict__,
-            "vad": vad_cfg.__dict__,
-            "vad_backend": args.vad_backend,
-            "webrtc": webrtc_cfg.__dict__,
-            "fade_s": args.fade,
-            "timestamps_only": bool(args.timestamps_only),
-        },
-        "prepass_removed": [],
-        "prepass_keep": [],
-        "vad_keep": [],
-    }
+    def run_transcription_for_input(single_input_path: str, out_prefix_override: Optional[str] = None) -> None:
+        dur_s = ffprobe_duration_seconds(single_input_path)
+        print(f"[info] input duration: {dur_s/3600:.2f} hours", file=sys.stderr)
 
-    # Default mode: if OUTPUT is omitted (and we're not in the explicit VAD/condense modes),
-    # run Whisper transcription and write <out_prefix>.txt/.json.
-    if (output_path is None) and (not args.timestamps_only) and (not args.condense_from_json):
-
-        base = os.path.splitext(os.path.basename(input_path))[0]
+        base = os.path.splitext(os.path.basename(single_input_path))[0]
         whisper_model = _resolve_whisper_model_name(args.whisper_model)
-        out_prefix = args.out_prefix or f"{base}_whisper_{_safe_slug(whisper_model)}"
+        out_prefix_local = out_prefix_override or args.out_prefix or f"{base}_whisper_{_safe_slug(whisper_model)}"
 
         vad_keep: Optional[List[Interval]] = None
         clip_timestamps: List[float] | str = "0"
@@ -1776,7 +1868,7 @@ def main() -> None:
         extra_payload: Dict[str, Any] = {}
 
         # Optional bandpass pre-processing for Whisper only (does not affect VAD passes).
-        whisper_input_path = input_path
+        whisper_input_path = single_input_path
         bandpass_ctx = None
         if args.bandpass:
             if args.keep_temp:
@@ -1795,7 +1887,7 @@ def main() -> None:
                 # try to continue through minor container corruption where possible
                 "-fflags", "+discardcorrupt",
                 "-err_detect", "ignore_err",
-                "-i", input_path,
+                "-i", single_input_path,
                 "-vn",
                 # 2 poles ~= 12 dB/oct ~= 40 dB/decade rolloff
                 "-af", "highpass=f=100:poles=2,lowpass=f=7000:poles=2",
@@ -1824,7 +1916,7 @@ def main() -> None:
                 workdir_ctx = tempfile.TemporaryDirectory(prefix="transcribe_prevad_")
                 workdir = workdir_ctx.name  # type: ignore
 
-            removed = detect_dead_air_intervals(input_path, dur_s, pre_cfg)
+            removed = detect_dead_air_intervals(single_input_path, dur_s, pre_cfg)
             keep_pre = complement_intervals(removed, dur_s)
             keep_pre = drop_short(keep_pre, 0.050)
             prepass_out_s = sum((e - s) for s, e in keep_pre)
@@ -1834,11 +1926,11 @@ def main() -> None:
             # Fast path: don't render a stitched intermediate file.
             # Stream only the keep intervals via ffmpeg concat demuxer and run VAD on that PCM stream.
             concat_list = os.path.join(workdir, "prepass_keep.concat.txt")
-            _write_ffmpeg_concat_list(input_path, keep_pre, concat_list)
+            _write_ffmpeg_concat_list(single_input_path, keep_pre, concat_list)
 
             print("[prevad] running WebRTC VAD on prepass keep intervals (ffmpeg concat -> PCM stream)", file=sys.stderr)
             vad_keep_stitched = webrtc_vad_speech_segments_streaming_ffmpeg(
-                input_path,
+                single_input_path,
                 prepass_out_s,
                 vad_cfg,
                 webrtc_cfg,
@@ -1867,9 +1959,9 @@ def main() -> None:
 
         whisper_transcribe_to_files(
             input_path=whisper_input_path,
-            out_prefix=out_prefix,
-            anchor_file=input_path,
-            reported_input=input_path,
+            out_prefix=out_prefix_local,
+            anchor_file=single_input_path,
+            reported_input=single_input_path,
             model_name=whisper_model,
             device=args.whisper_device,
             compute_type=args.whisper_compute_type,
@@ -1897,7 +1989,88 @@ def main() -> None:
             batched=bool(args.batched),
             batch_size=int(args.batch_size),
         )
+
+    # Directory batch transcription mode with resume/skip.
+    if input_is_dir:
+        if args.timestamps_only or args.condense_from_json or args.postprocess_json:
+            die("Directory INPUT is supported only in transcription mode.")
+        if args.out_prefix:
+            die("Directory INPUT does not support --out-prefix. Use OUTPUT as the output directory.")
+        if output_path is None:
+            die("Directory INPUT requires OUTPUT to be an output directory.")
+
+        out_dir = os.path.abspath(output_path)
+        if os.path.exists(out_dir) and (not os.path.isdir(out_dir)):
+            die(f"OUTPUT exists and is not a directory: {out_dir}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        audio_files = _list_audio_files_in_dir(input_path)
+        if not audio_files:
+            die(f"No supported audio/video files found in: {input_path}")
+
+        model_slug = _safe_slug(_resolve_whisper_model_name(args.whisper_model))
+        total = len(audio_files)
+        done = 0
+        skipped = 0
+        failed = 0
+        for idx, src in enumerate(audio_files, start=1):
+            base = os.path.splitext(os.path.basename(src))[0]
+            out_prefix = _batch_out_prefix_for_source(src, out_dir, model_slug)
+            # Backward compatibility with earlier directory-mode naming.
+            legacy_out_prefix = os.path.join(out_dir, f"{base}_whisper_{model_slug}")
+            if _transcription_outputs_complete(out_prefix, int(args.section_minutes)):
+                skipped += 1
+                print(f"[batch {idx}/{total}] skip (already done): {src}", file=sys.stderr)
+                continue
+            if out_prefix != legacy_out_prefix and _transcription_outputs_complete(legacy_out_prefix, int(args.section_minutes)):
+                skipped += 1
+                print(f"[batch {idx}/{total}] skip (already done, legacy prefix): {src}", file=sys.stderr)
+                continue
+
+            print(f"[batch {idx}/{total}] transcribing: {src}", file=sys.stderr)
+            try:
+                run_transcription_for_input(src, out_prefix_override=out_prefix)
+                done += 1
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                failed += 1
+                print(f"[batch {idx}/{total}] failed: {src}: {e}", file=sys.stderr)
+
+        print(f"[batch] done={done} skipped={skipped} failed={failed}", file=sys.stderr)
+        if failed > 0:
+            die("Batch finished with failures. Fix errors and re-run; completed files will be skipped.")
         return
+
+    # Default mode: if OUTPUT is omitted (and we're not in the explicit VAD/condense modes),
+    # run Whisper transcription and write <out_prefix>.txt/.json.
+    if (output_path is None) and (not args.timestamps_only) and (not args.condense_from_json):
+        run_transcription_for_input(input_path)
+        return
+
+    if not input_is_file:
+        die("This mode requires INPUT to be a single file.")
+
+    dur_s = ffprobe_duration_seconds(input_path)
+    print(f"[info] input duration: {dur_s/3600:.2f} hours", file=sys.stderr)
+
+    report = {
+        "input": os.path.abspath(input_path),
+        "output": os.path.abspath(output_path) if output_path else None,
+        "input_duration_s": dur_s,
+        "settings": {
+            "gap_cut_s": args.gap_cut,
+            "prepass": pre_cfg.__dict__,
+            "vad": vad_cfg.__dict__,
+            "vad_backend": args.vad_backend,
+            "webrtc": webrtc_cfg.__dict__,
+            "fade_s": args.fade,
+            "timestamps_only": bool(args.timestamps_only),
+        },
+        "prepass_removed": [],
+        "prepass_keep": [],
+        "vad_keep": [],
+    }
 
     if args.condense_from_json:
         if args.timestamps_only:
