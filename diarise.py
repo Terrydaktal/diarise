@@ -2027,19 +2027,39 @@ def main() -> None:
                 print(f"[batch {idx}/{total}] skip (already done, legacy prefix): {src}", file=sys.stderr)
                 continue
 
+            # Corrupt exports are sometimes zero-byte files; skip them without aborting the batch.
+            try:
+                if os.path.getsize(src) <= 0:
+                    failed += 1
+                    print(f"[batch {idx}/{total}] failed (empty input file): {src}", file=sys.stderr)
+                    continue
+            except OSError as e:
+                failed += 1
+                print(f"[batch {idx}/{total}] failed (cannot stat input): {src}: {e}", file=sys.stderr)
+                continue
+
             print(f"[batch {idx}/{total}] transcribing: {src}", file=sys.stderr)
             try:
                 run_transcription_for_input(src, out_prefix_override=out_prefix)
                 done += 1
             except KeyboardInterrupt:
                 raise
+            except SystemExit as e:
+                failed += 1
+                # die() raises SystemExit; keep batch moving on bad/corrupt files.
+                detail = str(e).strip() or f"exit code {getattr(e, 'code', 1)}"
+                print(f"[batch {idx}/{total}] failed: {src}: {detail}", file=sys.stderr)
             except Exception as e:
                 failed += 1
                 print(f"[batch {idx}/{total}] failed: {src}: {e}", file=sys.stderr)
 
         print(f"[batch] done={done} skipped={skipped} failed={failed}", file=sys.stderr)
         if failed > 0:
-            die("Batch finished with failures. Fix errors and re-run; completed files will be skipped.")
+            print(
+                "[warn] batch finished with some failed files. "
+                "Fix or remove them and re-run; completed files will be skipped.",
+                file=sys.stderr,
+            )
         return
 
     # Default mode: if OUTPUT is omitted (and we're not in the explicit VAD/condense modes),
