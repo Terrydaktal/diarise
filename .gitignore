@@ -1,3 +1,4 @@
+.venv
 .venv/
 venv/
 __pycache__/
@@ -43,3 +44,7 @@ diarise_run.log
 
 # Local model/cache
 .hf_cache/
+
+# UV / local Python env metadata
+.python-version
+uv.lock
